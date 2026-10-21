@@ -9,6 +9,7 @@ import time
 import secrets
 
 import qrcode
+import shiboken6
 
 from aiohttp import web
 from PySide6.QtCore import QObject, QRect, Qt, QTimer, Signal, Slot
@@ -600,7 +601,6 @@ class Desktop(QMainWindow):
     def closeEvent(self,event):
         self.closing = True
         self.obs.hide()
-        self.obs.deleteLater()
         self.diagnostics.hide()
         self.server.close()
         event.accept()
@@ -623,4 +623,10 @@ def main():
     window=Desktop(server)
     window.show()
     app.aboutToQuit.connect(server.close)
-    sys.exit(app.exec())
+    code=app.exec()
+    # Interpreter shutdown destroys PySide objects in arbitrary order; widgets
+    # dying after the QApplication segfault inside QWidget::~QWidget. Delete
+    # the windows while the application object still exists.
+    shiboken6.delete(window.obs)
+    shiboken6.delete(window)
+    sys.exit(code)
