@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+build/
+dist/
+*.egg-info/
+*.spec
+.DS_Store
+artifacts/
+android/.gradle/
+android/**/build/
+android/local.properties
+*.jks
+*.keystore
+
+android/signing/*.keystore
