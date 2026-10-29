@@ -4,16 +4,24 @@ import unittest
 
 from aiohttp import WSMsgType
 from aiohttp.test_utils import AioHTTPTestCase
-from airframe.server import Room, create_app, video_settings
+from airframe.server import Room, create_app, validate_signal, video_settings
 
 
 class SettingsTests(unittest.TestCase):
     def test_profiles(self):
-        self.assertEqual(video_settings({})["fps"], 30)
+        self.assertEqual(video_settings({}), {"fps": 120, "bitrate": 80, "maxSize": 2560})
         self.assertEqual(video_settings({"fps":60,"bitrate":24,"maxSize":2560})["fps"],60)
         self.assertEqual(video_settings({"fps":120,"bitrate":80})["fps"],120)
         for value in ({"fps":90},{"fps":True},{"bitrate":100},{"maxSize":999},[],None):
             with self.assertRaises(ValueError):video_settings(value)
+
+    def test_volume_commands(self):
+        self.assertTrue(validate_signal("receiver",{"type":"volume","value":0}))
+        self.assertTrue(validate_signal("receiver",{"type":"volume","value":100}))
+        for bad in ({"type":"volume","value":101},{"type":"volume","value":-1},
+                    {"type":"volume","value":"50"},{"type":"volume"}):
+            self.assertFalse(validate_signal("receiver",bad),bad)
+        self.assertFalse(validate_signal("sender",{"type":"volume","value":50}))
 
     def test_code_expiry_and_strong_reconnect_token(self):
         room=Room(); code=room.code
@@ -59,7 +67,7 @@ class SignalingTests(AioHTTPTestCase):
         sender,auth=await self.connect('sender')
         resume=auth['resumeToken']
         self.assertEqual((await receiver.receive_json(timeout=2))['type'],'peer-ready')
-        self.assertEqual((await sender.receive_json(timeout=2))['settings']['fps'],30)
+        self.assertEqual((await sender.receive_json(timeout=2))['settings']['fps'],120)
         await sender.send_json({'type':'offer','session':'1','sdp':'offer-sdp'})
         self.assertEqual((await receiver.receive_json(timeout=2))['sdp'],'offer-sdp')
         await receiver.send_json({'type':'answer','session':'1','sdp':'answer-sdp'})

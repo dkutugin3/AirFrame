@@ -28,6 +28,7 @@ args=parser.parse_args()
 work=Path('/portable-work');work.mkdir(exist_ok=True)
 out=Path('/portable-out');out.mkdir(exist_ok=True)
 wheel=next(Path('/out').glob('airframe-*.whl'))
+version=wheel.stem.split('-')[1]
 manifest={'target':args.target,'application':hashlib.sha256(wheel.read_bytes()).hexdigest(),'wheels':{}}
 
 if args.target.startswith('macos'):
@@ -52,7 +53,7 @@ if args.target.startswith('macos'):
     (resources/'app-entry.py').write_text('from airframe.desktop import main\nmain()\n')
     with (root/'Info.plist').open('wb') as output:
         plistlib.dump({'CFBundleName':'AirFrame','CFBundleDisplayName':'AirFrame','CFBundleIdentifier':'video.airframe.desktop',
-                      'CFBundleVersion':'1','CFBundleShortVersionString':'0.3.0','CFBundleExecutable':'AirFrame',
+                      'CFBundleVersion':'1','CFBundleShortVersionString':version,'CFBundleExecutable':'AirFrame',
                       'CFBundlePackageType':'APPL','NSHighResolutionCapable':True,'LSMinimumSystemVersion':'14.0',
                       'NSLocalNetworkUsageDescription':'AirFrame принимает экран вашего Android по локальной сети.'},output)
 else:

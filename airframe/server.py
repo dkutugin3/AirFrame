@@ -11,7 +11,7 @@ import time
 from aiohttp import WSMsgType, web
 
 STATE = web.AppKey("state", object)
-DEFAULTS = {"fps": 30, "bitrate": 10, "maxSize": 1920}
+DEFAULTS = {"fps": 120, "bitrate": 80, "maxSize": 2560}
 
 
 def video_settings(value):
@@ -152,6 +152,8 @@ def validate_signal(role, message):
             return False
         return (type(message.get("applied")) is bool and isinstance(message.get("requestId"), str)
                 and len(message["requestId"]) <= 64)
+    if kind == "volume" and role == "receiver":
+        return type(message.get("value")) is int and 0 <= message["value"] <= 100
     return kind == "restart" and role == "receiver"
 
 

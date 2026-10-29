@@ -7,6 +7,7 @@ import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
+import android.media.AudioManager;
 import android.media.projection.MediaProjection;
 import android.net.wifi.WifiManager;
 import android.os.Build;
@@ -42,6 +43,7 @@ public class ProjectionService extends Service {
     private RtpSender sender;
     private PowerManager.WakeLock wake;
     private WifiManager.WifiLock wifi;
+    private AudioManager audio;
     private String address, credential;
     private boolean closing=false, remoteSet=false, negotiating=false, restartPending=false;
     private int attempts=0, restarts=0, generation=0;
@@ -66,6 +68,7 @@ public class ProjectionService extends Service {
                     send(json("type","telemetry","session",String.valueOf(generation),
                             "encodedFps",actual,"width",number(members.get("frameWidth")).intValue(),
                             "height",number(members.get("frameHeight")).intValue(),
+                            "volume",phoneVolume(),
                             "limitation",String.valueOf(members.getOrDefault("qualityLimitationReason","unknown"))));
                 }
             }));
@@ -112,6 +115,7 @@ public class ProjectionService extends Service {
             wake.setReferenceCounted(false);renewWake.run();
             WifiManager wm=(WifiManager)getApplicationContext().getSystemService(WIFI_SERVICE);
             wifi=wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF,"airframe:wifi");wifi.acquire();
+            audio=(AudioManager)getSystemService(AUDIO_SERVICE);
             PeerConnectionFactory.initialize(PeerConnectionFactory.InitializationOptions.builder(this).createInitializationOptions());
             egl=EglBase.create();
             factory=PeerConnectionFactory.builder()
@@ -164,9 +168,22 @@ public class ProjectionService extends Service {
 
     private void configure(JSONObject settings) {
         if(settings==null)return;
-        fps=settings.optInt("fps",30);bitrate=settings.optInt("bitrate",10);maxSize=settings.optInt("maxSize",1920);
+        fps=settings.optInt("fps",120);bitrate=settings.optInt("bitrate",80);maxSize=settings.optInt("maxSize",2560);
         resize(0,0);
         applyEncoding();
+    }
+
+    private int phoneVolume() {
+        int max=audio==null?0:audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+        return max<=0 ? -1 : Math.round(100f*audio.getStreamVolume(AudioManager.STREAM_MUSIC)/max);
+    }
+
+    private void setPhoneVolume(int percent) {
+        int max=audio==null?0:audio.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+        if(max<=0)return;
+        int index=Math.max(0,Math.min(max,Math.round(percent/100f*max)));
+        try{audio.setStreamVolume(AudioManager.STREAM_MUSIC,index,AudioManager.FLAG_SHOW_UI);}
+        catch(Exception ignored){}
     }
 
     private void applyEncoding() {
@@ -231,6 +248,7 @@ public class ProjectionService extends Service {
                 if(peer!=null && remoteSet)peer.addIceCandidate(ice);else if(pendingIce.size()<128)pendingIce.add(ice);
                 break;
             case "restart":scheduleRestart();break;
+            case "volume":setPhoneVolume(message.optInt("value",50));break;
             case "peer-left":closePeer();status="Окно приёмника закрыто. Ожидание…";break;
             case "stop":status="Трансляция завершена с компьютера";stopSelf();break;
             case "error":status=message.optString("message","Ошибка подключения");stopSelf();break;

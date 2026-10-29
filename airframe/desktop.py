@@ -25,6 +25,7 @@ from .receiver import Receiver
 from .server import Room, create_app, video_settings
 
 PRESETS = {
+    "Максимум · 120 fps": {"fps": 120, "bitrate": 80, "maxSize": 2560},
     "Стабильность · 30 fps": {"fps": 30, "bitrate": 10, "maxSize": 1920},
     "Плавность · 60 fps": {"fps": 60, "bitrate": 16, "maxSize": 1920},
     "Качество · 60 fps": {"fps": 60, "bitrate": 24, "maxSize": 2560},
@@ -163,6 +164,11 @@ class LocalServer:
     def set_playout(self, mode):
         async def change():
             self.receiver.set_playout(mode)
+        self.submit(change())
+
+    def set_volume(self, value):
+        async def change():
+            await self.room.send("sender", {"type": "volume", "value": value})
         self.submit(change())
 
     def stop_stream(self):
@@ -339,7 +345,7 @@ class Desktop(QMainWindow):
         cl.addWidget(text("На Android нажмите «Сканировать QR». После сканирования разрешите захват экрана.","muted",True))
         right.addWidget(connection)
         quality, ql = panel()
-        quality.setMinimumHeight(330)
+        quality.setMinimumHeight(430)
         ql.addWidget(text("02   НАСТРОЙТЕ КАЧЕСТВО","eyebrow"))
         self.profile = QComboBox()
         self.profile.addItems([*PRESETS,"Свой профиль"])
@@ -384,7 +390,24 @@ class Desktop(QMainWindow):
         ql.addWidget(self.playout_mode)
         ql.addWidget(text("Стабильность сглаживает поступление кадров пачками ценой дополнительной задержки. "
                           "Паузы длиннее запаса или пропущенные телефоном кадры могут остаться заметны.","muted",True))
-        ql.addWidget(text("WebRTC адаптирует передачу к сети. Звук и управление телефоном в 0.1 не передаются.","muted",True))
+        ql.addWidget(text("Громкость телефона","eyebrow"))
+        volume_row = QHBoxLayout()
+        self.phone_volume = QSlider(Qt.Orientation.Horizontal)
+        self.phone_volume.setRange(0,100)
+        self.phone_volume.setEnabled(False)
+        self.volume_value = text("—","muted")
+        self.volume_value.setMinimumWidth(40)
+        volume_row.addWidget(self.phone_volume,1)
+        volume_row.addWidget(self.volume_value)
+        ql.addLayout(volume_row)
+        self.volume_dragging = False
+        self.volume_sent_at = 0.0
+        self.phone_volume.sliderPressed.connect(lambda: setattr(self,"volume_dragging",True))
+        self.phone_volume.sliderReleased.connect(self.volume_released)
+        self.phone_volume.sliderMoved.connect(self.volume_moved)
+        ql.addWidget(text("Мультимедиа-громкость подключённого телефона. Ползунок синхронизируется, "
+                          "если менять звук на самом телефоне.","muted",True))
+        ql.addWidget(text("WebRTC адаптирует передачу к сети. Сам звук телефона не передаётся; громкость регулируется выше.","muted",True))
         right.addWidget(quality)
         self.stop = QPushButton("■  Завершить трансляцию")
         self.stop.setEnabled(False)
@@ -404,7 +427,7 @@ class Desktop(QMainWindow):
         body.addWidget(right_area)
         layout.addLayout(body,1)
         footer = QHBoxLayout()
-        footer.addWidget(text("AIRFRAME 0.3.0   ·   НАТИВНЫЙ ПРИЁМНИК","muted"))
+        footer.addWidget(text("AIRFRAME 0.4.0   ·   НАТИВНЫЙ ПРИЁМНИК","muted"))
         footer.addStretch()
         diagnostics = QPushButton("Диагностика и инструкция")
         diagnostics.clicked.connect(self.show_diagnostics)
@@ -506,6 +529,16 @@ class Desktop(QMainWindow):
         self.profile.setCurrentText("Свой профиль")
         self.rate_label.setText(f"Битрейт: максимум {self.rate.value()} Мбит/с")
 
+    def volume_moved(self, value):
+        if time.monotonic() - self.volume_sent_at < .150:
+            return
+        self.volume_sent_at = time.monotonic()
+        self.server.set_volume(value)
+
+    def volume_released(self):
+        self.volume_dragging = False
+        self.server.set_volume(self.phone_volume.value())
+
     def apply_profile(self):
         settings = {"fps":self.target_fps.currentData(),
                     "maxSize":self.max_size.currentData(),"bitrate":self.rate.value()}
@@ -577,6 +610,12 @@ class Desktop(QMainWindow):
                                 f" · восстановлений буфера: {stats.get('bufferRecoveries',0)}")
         sender_detail = (f" · кодировщик: {stats['encodedFps']:.0f} fps, {stats['width']} × {stats['height']}"
                          f" · ограничение: {stats['limitation']}" if "encodedFps" in stats else "")
+        volume = stats.get("volume") if stats else None
+        if not self.volume_dragging:
+            self.phone_volume.setEnabled(volume is not None)
+            if volume is not None:
+                self.phone_volume.setValue(int(volume))
+        self.volume_value.setText(f"{int(volume)}%" if volume is not None else "—")
         self.loss.setText(f"Потери: {stats['loss']:.1f}% · {size} · приём включает WebRTC overhead{sender_detail}{pipeline_detail}" if stats else "Потери: — · размер: —")
 
     def open_obs(self):

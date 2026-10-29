@@ -44,6 +44,8 @@ class Receiver:
             self.on_state("idle", "Телефон отключился. Ожидаем повторного подключения.")
         elif kind == "telemetry" and message["session"] == self.session:
             self.sender_stats = {k: message[k] for k in ("encodedFps", "width", "height", "limitation")}
+            if "volume" in message:
+                self.sender_stats["volume"] = message["volume"]
         elif kind == "configured":
             self.on_stats({"configured": message})
         elif kind == "offer":
