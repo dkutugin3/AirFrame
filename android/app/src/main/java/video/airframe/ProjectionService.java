@@ -1,6 +1,5 @@
 package video.airframe;
 
-import android.app.Activity;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -8,7 +7,14 @@ import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
+import android.media.AudioAttributes;
+import android.media.AudioFormat;
 import android.media.AudioManager;
+import android.media.AudioPlaybackCaptureConfiguration;
+import android.media.AudioRecord;
+import android.media.MediaCodec;
+import android.media.MediaCodecInfo;
+import android.media.MediaFormat;
 import android.media.projection.MediaProjection;
 import android.net.wifi.WifiManager;
 import android.os.Build;
@@ -23,6 +29,8 @@ import org.json.JSONObject;
 import org.webrtc.*;
 import okhttp3.*;
 
+import java.lang.reflect.Field;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -42,10 +50,11 @@ public class ProjectionService extends Service {
     private VideoTrack track;
     private PeerConnection peer;
     private RtpSender sender;
-    private AudioSource audioSource;
-    private AudioTrack audioTrack;
-    private org.webrtc.audio.AudioDeviceModule audioDeviceModule;
-    private volatile boolean audioEnabled=true;
+    private DataChannel audioChannel;
+    private AudioRecord audioCapture;
+    private MediaCodec audioEncoder;
+    private Thread audioThread;
+    private volatile boolean audioEnabled=true, audioRunning=false;
     private PowerManager.WakeLock wake;
     private WifiManager.WifiLock wifi;
     private AudioManager audio;
@@ -129,17 +138,10 @@ public class ProjectionService extends Service {
             audio=(AudioManager)getSystemService(AUDIO_SERVICE);
             PeerConnectionFactory.initialize(PeerConnectionFactory.InitializationOptions.builder(this).createInitializationOptions());
             egl=EglBase.create();
-            audioDeviceModule=buildCaptureModule(intent.getIntExtra("resultCode", Activity.RESULT_OK),permission);
-            PeerConnectionFactory.Builder factoryBuilder=PeerConnectionFactory.builder()
+            factory=PeerConnectionFactory.builder()
                     .setVideoEncoderFactory(new DefaultVideoEncoderFactory(egl.getEglBaseContext(),true,true))
-                    .setVideoDecoderFactory(new DefaultVideoDecoderFactory(egl.getEglBaseContext()));
-            if(audioDeviceModule!=null)factoryBuilder.setAudioDeviceModule(audioDeviceModule);
-            factory=factoryBuilder.createPeerConnectionFactory();
-            if(audioDeviceModule!=null){
-                audioSource=factory.createAudioSource(new MediaConstraints());
-                audioTrack=factory.createAudioTrack("airframe-audio",audioSource);
-                audioTrack.setEnabled(audioEnabled);
-            }
+                    .setVideoDecoderFactory(new DefaultVideoDecoderFactory(egl.getEglBaseContext()))
+                    .createPeerConnectionFactory();
             texture=SurfaceTextureHelper.create("AirFrame-capture",egl.getEglBaseContext());
             source=factory.createVideoSource(true);
             capturer=new ScreenCapturerAndroid(permission,new MediaProjection.Callback(){
@@ -167,21 +169,95 @@ public class ProjectionService extends Service {
     }
 
     /**
-     * Phone-audio playback capture is intentionally disabled on the pinned SDK.
-     *
-     * Android 10+ playback capture requires an {@code AudioRecord} built with
-     * {@code AudioPlaybackCaptureConfiguration} to be injected into WebRTC. This build pins
-     * io.github.webrtc-sdk:android:150.7871.01, whose JavaAudioDeviceModule only exposes
-     * {@code setAudioSource(int)}: there is no {@code setAudioRecord(AudioRecord)} and no custom
-     * {@code AudioDeviceModule} builder, so the preserved user WIP cannot be wired here.
-     * Returning null keeps the audio track disabled and video streaming unchanged; the original
-     * playback-capture implementation stays preserved in git (tag wip-phone-audio-0.5.0-preserved).
-     *
-     * A second {@code MediaProjectionManager.getMediaProjection()} call is deliberately NOT made:
-     * ScreenCapturerAndroid must consume the single projection grant.
+     * Phone audio rides the WebRTC data channel, not an RTP audio track: the pinned
+     * io.github.webrtc-sdk has no setAudioRecord(AudioRecord) to feed an AudioPlaybackCapture
+     * AudioRecord into JavaAudioDeviceModule. We capture playback PCM ourselves, encode AAC
+     * with MediaCodec and send self-describing config+frame messages; the desktop decodes
+     * with PyAV. The projection for playback capture is taken from ScreenCapturerAndroid
+     * via reflection, so the single projection grant is never consumed twice.
      */
-    private org.webrtc.audio.AudioDeviceModule buildCaptureModule(int resultCode, Intent permission) {
-        return null;
+    private MediaProjection projectionForAudio() {
+        if(Build.VERSION.SDK_INT<29)return null;
+        try{
+            Field field=ScreenCapturerAndroid.class.getDeclaredField("mediaProjection");
+            field.setAccessible(true);
+            return (MediaProjection)field.get(capturer);
+        }catch(Exception error){return null;}
+    }
+
+    private void startAudio() {
+        if(audioRunning || audioChannel==null || audioChannel.state()!=DataChannel.State.OPEN)return;
+        try{
+            MediaProjection projection=projectionForAudio();
+            if(projection==null)return;
+            audioCapture=new AudioRecord.Builder()
+                    .setAudioFormat(new AudioFormat.Builder()
+                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                            .setSampleRate(48000)
+                            .setChannelMask(AudioFormat.CHANNEL_IN_STEREO).build())
+                    .setBufferSizeInBytes(8192)
+                    .setAudioPlaybackCaptureConfig(new AudioPlaybackCaptureConfiguration.Builder(projection)
+                            .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                            .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                            .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN).build())
+                    .build();
+            audioEncoder=MediaCodec.createEncoderByType("audio/mp4a-latm");
+            MediaFormat format=MediaFormat.createAudioFormat("audio/mp4a-latm",48000,2);
+            format.setInteger(MediaFormat.KEY_BIT_RATE,96000);
+            format.setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC);
+            audioEncoder.configure(format,null,null,MediaCodec.CONFIGURE_FLAG_ENCODE);
+            audioEncoder.start();
+            audioCapture.startRecording();
+            audioRunning=true;
+            audioThread=new Thread(this::captureAudioLoop,"AirFrame-audio");
+            audioThread.start();
+        }catch(Exception error){stopAudio();}
+    }
+
+    private void stopAudio() {
+        audioRunning=false;
+        if(audioCapture!=null){try{audioCapture.stop();}catch(Exception ignored){}}
+        Thread worker=audioThread;
+        if(worker!=null){try{worker.join(500);}catch(InterruptedException ignored){Thread.currentThread().interrupt();}}
+        if(audioThread==worker)audioThread=null;
+    }
+
+    /** Capture thread: owns the record and the codec; releases them on exit. */
+    private void captureAudioLoop() {
+        ByteBuffer pcm=ByteBuffer.allocateDirect(8192);
+        MediaCodec.BufferInfo info=new MediaCodec.BufferInfo();
+        long pts=0;
+        try{
+            while(audioRunning && audioChannel!=null && audioChannel.state()==DataChannel.State.OPEN){
+                if(!audioEnabled){Thread.sleep(50);continue;}
+                int read=audioCapture.read(pcm,4096);
+                if(read<=0)continue;
+                int input=audioEncoder.dequeueInputBuffer(10000);
+                if(input>=0){
+                    ByteBuffer in=audioEncoder.getInputBuffer(input);
+                    in.clear();pcm.position(0);pcm.limit(read);in.put(pcm);
+                    audioEncoder.queueInputBuffer(input,0,read,pts,0);
+                    pts+=read*1000000L/(48000*4);
+                }
+                int output;
+                while(audioRunning && (output=audioEncoder.dequeueOutputBuffer(info,0))>=0){
+                    ByteBuffer encoded=audioEncoder.getOutputBuffer(output);
+                    byte[] payload=new byte[info.size];
+                    encoded.position(info.offset);encoded.get(payload);
+                    ByteBuffer message=ByteBuffer.allocate(1+payload.length);
+                    message.put((byte)(((info.flags & MediaCodec.BUFFER_FLAG_CODEC_CONFIG)!=0)?0:1)).put(payload).flip();
+                    // This WebRTC build takes a DataChannel.Buffer, not a raw ByteBuffer. Audio
+                    // frames are binary; the first payload byte keeps the codec-config/audio flag.
+                    audioChannel.send(new DataChannel.Buffer(message,true));
+                    audioEncoder.releaseOutputBuffer(output,false);
+                }
+            }
+        }catch(Exception ignored){
+        }finally{
+            if(audioEncoder!=null){try{audioEncoder.stop();}catch(Exception ignored){}try{audioEncoder.release();}catch(Exception ignored){}audioEncoder=null;}
+            if(audioCapture!=null){try{audioCapture.release();}catch(Exception ignored){}audioCapture=null;}
+            audioRunning=false;
+        }
     }
 
     private int[] captureSize(int width,int height) {
@@ -295,7 +371,7 @@ public class ProjectionService extends Service {
             case "volume":setPhoneVolume(message.optInt("value",50));break;
             case "audio":
                 audioEnabled=message.optBoolean("enabled");
-                if(audioTrack!=null)audioTrack.setEnabled(audioEnabled);
+                if(audioEnabled)startAudio();else stopAudio();
                 break;
             case "peer-left":closePeer();status="Окно приёмника закрыто. Ожидание…";break;
             case "stop":status="Трансляция завершена с компьютера";stopSelf();break;
@@ -338,7 +414,18 @@ public class ProjectionService extends Service {
         });
         if(peer==null){status="Не удалось создать WebRTC сеанс";stopSelf();return;}
         sender=peer.addTrack(track,Collections.singletonList("airframe"));
-        if(audioTrack!=null)peer.addTrack(audioTrack,Collections.singletonList("airframe"));
+        DataChannel.Init audioInit=new DataChannel.Init();
+        audioInit.ordered=true;
+        audioChannel=peer.createDataChannel("airframe-audio",audioInit);
+        audioChannel.registerObserver(new DataChannel.Observer(){
+            @Override public void onBufferedAmountChange(long previousAmount){}
+            @Override public void onMessage(DataChannel.Buffer buffer){}
+            @Override public void onStateChange(){main.post(()->{
+                if(audioChannel==null)return;
+                if(audioChannel.state()==DataChannel.State.OPEN && audioEnabled)startAudio();
+                else stopAudio();
+            });}
+        });
         // Prefer hardware H.264; keep VP8/VP9 as negotiated fallbacks.
         List<RtpCapabilities.CodecCapability> codecs=new ArrayList<>(factory.getRtpSenderCapabilities(MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO).codecs);
         codecs.sort((a,b)->Boolean.compare(!a.name.equalsIgnoreCase("H264"),!b.name.equalsIgnoreCase("H264")));
@@ -370,6 +457,7 @@ public class ProjectionService extends Service {
         lastFrames=0;lastStatsNs=0;generation++;remoteSet=false;negotiating=false;restartPending=false;pendingIce.clear();
         if(restartTask!=null)main.removeCallbacks(restartTask);
         if(stableTask!=null)main.removeCallbacks(stableTask);
+        audioChannel=null;stopAudio();
         if(peer!=null){peer.close();peer.dispose();peer=null;sender=null;}
     }
 
@@ -386,9 +474,6 @@ public class ProjectionService extends Service {
         if(socket!=null){socket.close(1000,"Stopped");socket=null;}
         closePeer();
         if(capturer!=null){try{capturer.stopCapture();}catch(Exception ignored){}capturer.dispose();}
-        if(audioTrack!=null)audioTrack.dispose();
-        if(audioSource!=null)audioSource.dispose();
-        if(audioDeviceModule!=null)audioDeviceModule.release();
         if(track!=null)track.dispose();
         if(source!=null)source.dispose();
         if(texture!=null)texture.dispose();
