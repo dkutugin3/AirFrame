@@ -6,6 +6,7 @@ RUN pip install 'aiohttp>=3.13.5,<4' 'aiortc==1.15.0' 'setuptools>=69' build
 COPY pyproject.toml ./
 COPY airframe ./airframe
 RUN pip install --no-deps --no-build-isolation .
+COPY scripts ./scripts
 COPY tests ./tests
 RUN python -m unittest discover -s tests -v
 CMD ["python", "-m", "unittest", "discover", "-s", "tests", "-v"]
