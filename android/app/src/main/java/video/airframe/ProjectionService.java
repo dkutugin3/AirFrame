@@ -8,11 +8,7 @@ import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
-import android.media.AudioAttributes;
-import android.media.AudioFormat;
 import android.media.AudioManager;
-import android.media.AudioPlaybackCaptureConfiguration;
-import android.media.AudioRecord;
 import android.media.projection.MediaProjection;
 import android.net.wifi.WifiManager;
 import android.os.Build;
@@ -25,7 +21,6 @@ import android.view.WindowManager;
 
 import org.json.JSONObject;
 import org.webrtc.*;
-import org.webrtc.audio.JavaAudioDeviceModule;
 import okhttp3.*;
 
 import java.util.ArrayList;
@@ -165,33 +160,22 @@ public class ProjectionService extends Service {
         return START_NOT_STICKY;
     }
 
-    /** Feed Android 10+ playback capture into WebRTC instead of the microphone. */
-    private org.webrtc.audio.AudioDeviceModule buildCaptureModule(int resultCode,Intent permission) {
-        if(Build.VERSION.SDK_INT<29)return null;
-        try{
-            MediaProjectionManager manager=(MediaProjectionManager)getSystemService(MEDIA_PROJECTION_SERVICE);
-            MediaProjection projection=manager.getMediaProjection(resultCode,permission);
-            if(projection==null)return null;
-            AudioRecord capture=new AudioRecord.Builder()
-                    .setAudioFormat(new AudioFormat.Builder()
-                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                            .setSampleRate(48000)
-                            .setChannelMask(AudioFormat.CHANNEL_IN_MONO).build())
-                    .setBufferSizeInBytes(4096)
-                    .setAudioPlaybackCaptureConfig(new AudioPlaybackCaptureConfiguration.Builder(projection)
-                            .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
-                            .addMatchingUsage(AudioAttributes.USAGE_GAME)
-                            .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN).build())
-                    .build();
-            return JavaAudioDeviceModule.builder(getApplicationContext())
-                    .setAudioSource(capture)
-                    .setSampleRate(48000)
-                    .setUseHardwareAcousticEchoCanceler(false)
-                    .setUseHardwareNoiseSuppressor(false)
-                    .createAudioDeviceModule();
-        }catch(Exception error){
-            return null;   // Audio capture is optional; video keeps working without it.
-        }
+    /**
+     * Phone-audio playback capture is intentionally disabled on the pinned SDK.
+     *
+     * Android 10+ playback capture requires an {@code AudioRecord} built with
+     * {@code AudioPlaybackCaptureConfiguration} to be injected into WebRTC. This build pins
+     * io.github.webrtc-sdk:android:150.7871.01, whose JavaAudioDeviceModule only exposes
+     * {@code setAudioSource(int)}: there is no {@code setAudioRecord(AudioRecord)} and no custom
+     * {@code AudioDeviceModule} builder, so the preserved user WIP cannot be wired here.
+     * Returning null keeps the audio track disabled and video streaming unchanged; the original
+     * playback-capture implementation stays preserved in git (tag wip-phone-audio-0.5.0-preserved).
+     *
+     * A second {@code MediaProjectionManager.getMediaProjection()} call is deliberately NOT made:
+     * ScreenCapturerAndroid must consume the single projection grant.
+     */
+    private org.webrtc.audio.AudioDeviceModule buildCaptureModule(int resultCode, Intent permission) {
+        return null;
     }
 
     private int[] captureSize(int width,int height) {
