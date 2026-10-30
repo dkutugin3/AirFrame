@@ -464,7 +464,7 @@ class DecodePipeline:
 
 
 def install_decoder_pipelines(peer, loop, request_keyframe=None, fps=60,
-                              clock=time.monotonic):
+                              clock=time.monotonic, decoder_factory=None):
     """Install one bounded DecodePipeline per video receiver after validation."""
     if aiortc.__version__ != '1.15.0':
         raise RuntimeError('AirFrame requires aiortc 1.15.0 for its decoder integration')
@@ -482,7 +482,8 @@ def install_decoder_pipelines(peer, loop, request_keyframe=None, fps=60,
                                    'update AirFrame decoder integration')
         if not callable(getattr(receiver, '_RTCRtpReceiver__stop_decoder')):
             raise RuntimeError('Incompatible aiortc decoder stop hook; update AirFrame integration')
-        pipeline = DecodePipeline(loop, request_keyframe=request_keyframe, fps=fps, clock=clock)
+        pipeline = DecodePipeline(loop, request_keyframe=request_keyframe, fps=fps, clock=clock,
+                                  decoder_factory=decoder_factory)
         receive = receiver.receive
 
         async def start_pipeline(parameters, _receive=receive, _pipeline=pipeline):
