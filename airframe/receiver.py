@@ -2,10 +2,12 @@
 import asyncio
 import time
 
+import av
 from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
 from aiortc.mediastreams import MediaStreamError
 from aiortc.sdp import candidate_from_sdp
 
+from .decode import install_decoder_pipelines
 from .transport import VIDEO_LOSS_DEADLINE, install_video_buffers
 from .playout import Playout
 
@@ -22,6 +24,8 @@ class Receiver:
         self.session = ""
         self.tasks = set()
         self.video_buffers = []
+        self.decode_pipelines = []
+        self.decode_pipeline = None
         self.closed = False
         self.frame_count = 0
         self.sender_stats = {}
@@ -83,12 +87,18 @@ class Receiver:
         def track_received(track):
             if track.kind == "video":
                 self.task(self.frames(current, track))
-            elif track.kind == "audio" and self.on_audio is not None:
-                self.task(self.audio(current, track))
+
+        @current.on("datachannel")
+        def channel_received(channel):
+            if channel.label == "airframe-audio" and self.on_audio is not None:
+                self.phone_audio(channel)
 
         try:
             await current.setRemoteDescription(RTCSessionDescription(sdp=message["sdp"], type="offer"))
             self.video_buffers = install_video_buffers(current)
+            self.decode_pipelines = install_decoder_pipelines(
+                current, asyncio.get_running_loop(), fps=self.room.settings["fps"])
+            self.decode_pipeline = self.decode_pipelines[0] if self.decode_pipelines else None
             self.task(self.watch_video_buffers(current, self.video_buffers))
             self.on_log(f"Видеобуфер RTP: 2048 пакетов, потеря ждёт "
                         f"{VIDEO_LOSS_DEADLINE*1000:.0f} мс, без дополнительной задержки вывода")
@@ -121,10 +131,21 @@ class Receiver:
                         self.on_log("Смена SSRC: таймеры и запросы прежней эпохи отменены")
                     if pli:
                         await self.request_keyframe(buffer)
+                for pipeline in self.decode_pipelines:
+                    if pipeline.poll():
+                        self.on_log("Перегрузка декодера: сброс эпохи, запрошен ключевой кадр (PLI)")
+                        await self.request_decoder_keyframe()
         except asyncio.CancelledError:
             pass
         except Exception as exc:
             self.on_log(f"Восстановление видео: {exc}")
+
+    async def request_decoder_keyframe(self):
+        """Request a keyframe after the decode queues were reset."""
+        for buffer in self.video_buffers:
+            if buffer.last_ssrc is not None:
+                await self.request_keyframe(buffer)
+                return
 
     async def request_keyframe(self, buffer):
         receiver = getattr(buffer, 'receiver', None)
@@ -156,19 +177,30 @@ class Receiver:
         self.on_stats({"playoutChanged": mode})
         self.on_log("Вывод: " + self.LABELS.get(mode, mode))
 
-    async def audio(self, current, track):
-        """Opus arrives as 48 kHz frames; hand packed s16 stereo to the audio sink."""
-        try:
-            while current is self.peer:
-                frame = await track.recv()
-                if current is not self.peer:
-                    break
-                pcm = frame.reformat(format="s16", layout="stereo")
-                self.on_audio(bytes(pcm.planes[0]))
-        except MediaStreamError:
-            pass
-        except Exception as exc:
-            self.on_log(f"Ошибка звука: {exc}")
+    def phone_audio(self, channel):
+        """Phone AAC over the data channel: message[0]=0 config / 1 frame, payload follows.
+        Decode with PyAV and hand packed s16 stereo to the audio sink."""
+        decoder = av.CodecContext.create("aac", "r")
+        resampler = av.AudioResampler(format="s16", layout="stereo", rate=48000)
+        configured = False
+
+        def message(data):
+            nonlocal configured
+            if not isinstance(data, (bytes, bytearray)) or not data:
+                return
+            try:
+                if data[0] == 0:
+                    decoder.extradata = bytes(data[1:])
+                    configured = True
+                elif data[0] == 1 and configured:
+                    for frame in decoder.decode(av.Packet(bytes(data[1:]))):
+                        converted = resampler.resample(frame)
+                        for out in (converted if isinstance(converted, list) else [converted]):
+                            self.on_audio(bytes(out.planes[0]))
+            except Exception as exc:
+                self.on_log(f"Ошибка звука: {exc}")
+
+        channel.on("message")(message)
 
     def report_playout_issue(self):
         """Surface an incompatible playout budget once, with the safe suggestion."""
@@ -287,7 +319,8 @@ class Receiver:
                                 f"декодер {self.max_frame_gap*1000:.0f} мс; "
                                 f"кадр до {transport.get('largestFrameKiB',0):.0f} КиБ; "
                                 f"восстановлений буфера {transport.get('bufferRecoveries',0)}")
-                self.on_stats({**self.sender_stats, **transport, **self.playout.metrics(), "fps": (self.frame_count - previous_frames) / elapsed,
+                decode = self.decode_pipeline.stats() if self.decode_pipeline else {}
+                self.on_stats({**decode, **self.sender_stats, **transport, **self.playout.metrics(), "fps": (self.frame_count - previous_frames) / elapsed,
                                "bitrate": max(0, received - previous_bytes) * 8 / elapsed / 1e6,
                                "jitter": jitter,
                                "convertedFps": (self.converted_count - previous_converted) / elapsed,
@@ -313,6 +346,9 @@ class Receiver:
         self.tasks.clear()
         if old:
             await old.close()
+        for pipeline in self.decode_pipelines:
+            pipeline.close()
+        self.decode_pipelines, self.decode_pipeline = [], None
         self.sender_stats = {}
         self.video_buffers = []
         self.converted_count = self.dropped_count = 0

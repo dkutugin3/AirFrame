@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import unittest
 
 from aiortc import RTCConfiguration, RTCPeerConnection, RTCRtpSender, VideoStreamTrack
@@ -318,3 +319,137 @@ class PacketLossRecoveryTests(AioHTTPTestCase):
             await sender.close()
         await asyncio.sleep(.05)
         self.assertIsNone(self.receiver.peer)
+
+
+class DataChannelAudioTests(unittest.TestCase):
+    # ffmpeg -f lavfi -i sine=frequency=440:sample_rate=48000 -t 0.1 -ac 2 -c:a aac ADTS frames.
+    ADTS = "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"
+
+    def test_aac_messages_decode_to_packed_s16(self):
+        stream = base64.b64decode(self.ADTS)
+        frames = []
+        offset = 0
+        while offset < len(stream):
+            length = ((stream[offset+3] & 0x03) << 11) | (stream[offset+4] << 3) | ((stream[offset+5] >> 5) & 0x07)
+            frames.append(stream[offset+7:offset+length])
+            offset += length
+
+        class FakeChannel:
+            label = "airframe-audio"
+            def __init__(self): self.handlers = {}
+            def on(self, event):
+                def register(handler):
+                    self.handlers[event] = handler
+                    return handler
+                return register
+
+        channel = FakeChannel()
+        delivered = []
+        receiver = Receiver(Room(), lambda f: None, lambda *a: None, lambda *a: None,
+                            lambda *a: None, delivered.append)
+        receiver.phone_audio(channel)
+        channel.handlers["message"](b"\x00" + bytes([0x12, 0x10]))  # AAC-LC 48 kHz stereo ASC
+        for payload in frames:
+            channel.handlers["message"](b"\x01" + payload)
+        self.assertTrue(delivered)
+        for chunk in delivered:
+            self.assertEqual(len(chunk) % 4, 0)
+
+
+
+class DecoderOverloadTests(AioHTTPTestCase):
+    async def get_application(self):
+        self.room = Room()
+        self.count = 0
+        self.frames_received = asyncio.Event()
+        self.metrics, self.logs = [], []
+        loop = asyncio.get_running_loop()
+
+        def record(frame):
+            if frame is not None:
+                self.count += 1
+                if self.count >= 5:
+                    self.frames_received.set()
+
+        self.receiver = Receiver(self.room, lambda frame: loop.call_soon_threadsafe(record, frame),
+                                 lambda *args: None, self.metrics.append, self.logs.append)
+        self.room.peers['receiver'] = self.receiver
+        return create_app(self.room)
+
+    async def test_decode_overload_is_bounded_and_recovered_with_metrics(self):
+        import time as time_module
+        import av
+        import airframe.decode as decode_module
+        from aiortc import RTCSessionDescription, RTCRtpSender
+        from aiortc.mediastreams import VIDEO_TIME_BASE
+
+        real_factory = decode_module.get_decoder
+
+        def slow_factory(codec):
+            inner = real_factory(codec)
+
+            class SlowDecoder:
+                def decode(self, frame):
+                    time_module.sleep(.25)
+                    return inner.decode(frame)
+
+            return SlowDecoder()
+
+        class SourceTrack(VideoStreamTrack):
+            def __init__(self):
+                super().__init__()
+                self.index = 0
+
+            async def recv(self):
+                await asyncio.sleep(1 / 30)
+                frame = av.VideoFrame(320, 180, 'yuv420p')
+                luma = 20 + (self.index % 25) * 7
+                frame.planes[0].update(bytes([luma]) * frame.planes[0].buffer_size)
+                for plane in frame.planes[1:]:
+                    plane.update(bytes([128]) * plane.buffer_size)
+                frame.pts = self.index * 3000
+                frame.time_base = VIDEO_TIME_BASE
+                self.index += 1
+                return frame
+
+        decode_module.get_decoder = slow_factory
+        sender = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+        socket = None
+        try:
+            sender.addTrack(SourceTrack())
+            capabilities = [codec for codec in RTCRtpSender.getCapabilities('video').codecs
+                            if codec.mimeType == 'video/H264']
+            sender.getTransceivers()[0].setCodecPreferences(capabilities)
+            socket = await self.client.ws_connect('/signal')
+            await socket.send_json({'role': 'sender', 'credential': self.room.code})
+            self.assertEqual((await socket.receive_json(timeout=3))['type'], 'authenticated')
+            self.assertEqual((await socket.receive_json(timeout=3))['type'], 'peer-ready')
+            await sender.setLocalDescription(await sender.createOffer())
+            await socket.send_json({'type': 'offer', 'session': 'overload-test',
+                                    'sdp': sender.localDescription.sdp})
+            answer = await socket.receive_json(timeout=5)
+            await sender.setRemoteDescription(RTCSessionDescription(type='answer', sdp=answer['sdp']))
+            await asyncio.wait_for(self.frames_received.wait(), timeout=10)
+            loop = asyncio.get_running_loop()
+            limit = loop.time() + 8
+            while not any(metric.get('decodeRecoveries', 0) >= 1 for metric in self.metrics):
+                if loop.time() > limit:
+                    self.fail(f'decode overload was not recovered: {self.logs}')
+                await asyncio.sleep(.1)
+            self.assertTrue(any('Перегрузка декодера' in log for log in self.logs), self.logs)
+            for metric in self.metrics:
+                if 'decodeQueueMaxFrames' in metric:
+                    self.assertLessEqual(metric['decodeQueueFrames'], metric['decodeQueueMaxFrames'])
+                    self.assertLess(metric['decodeQueueAgeMs'], 2000)
+                if 'decodedQueueMaxFrames' in metric:
+                    self.assertLessEqual(metric['decodedQueueFrames'], metric['decodedQueueMaxFrames'])
+            # Session close with slow/in-flight decoding must not hang.
+            started = time_module.monotonic()
+            await asyncio.wait_for(self.receiver.close(), 6)
+            self.assertLess(time_module.monotonic() - started, 5)
+            self.assertIsNone(self.receiver.peer)
+        finally:
+            decode_module.get_decoder = real_factory
+            if socket is not None:
+                await socket.close()
+            await sender.close()
