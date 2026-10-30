@@ -2,7 +2,7 @@
 
 Status: branch `codex/stable-60fps-tdd` (development branch of the stable-60fps
 plan; `pyproject.toml` version 0.5.0, not a release). Owner of this document:
-plan §14 deliverable. Last reviewed against HEAD `5212dba`; run
+plan §14 deliverable. Last reviewed against HEAD `34d1925`; run
 `sh scripts/verify.sh` for fresh evidence instead of trusting one revision.
 
 **Honesty rule.** This document lists only commands that exist in this branch and
