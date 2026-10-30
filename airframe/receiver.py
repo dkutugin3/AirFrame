@@ -6,11 +6,14 @@ from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
 from aiortc.mediastreams import MediaStreamError
 from aiortc.sdp import candidate_from_sdp
 
-from .transport import install_video_buffers
+from .transport import VIDEO_LOSS_DEADLINE, install_video_buffers
 from .playout import Playout
 
 
 class Receiver:
+    # Watchdog tick for RTP loss deadlines; the deadline itself is 150 ms.
+    RECOVERY_POLL = .020
+
     def __init__(self, room, on_frame, on_state, on_stats, on_log, on_audio=None, playout_mode="stable"):
         self.room = room
         self.on_frame, self.on_state, self.on_stats, self.on_log = on_frame, on_state, on_stats, on_log
@@ -86,7 +89,9 @@ class Receiver:
         try:
             await current.setRemoteDescription(RTCSessionDescription(sdp=message["sdp"], type="offer"))
             self.video_buffers = install_video_buffers(current)
-            self.on_log("Видеобуфер RTP: 2048 пакетов, без дополнительной задержки воспроизведения")
+            self.task(self.watch_video_buffers(current, self.video_buffers))
+            self.on_log(f"Видеобуфер RTP: 2048 пакетов, потеря ждёт "
+                        f"{VIDEO_LOSS_DEADLINE*1000:.0f} мс, без дополнительной задержки вывода")
             await current.setLocalDescription(await current.createAnswer())
             await self.room.send("sender", {"type": "answer", "session": self.session, "sdp": current.localDescription.sdp})
             self.task(self.statistics(current))
@@ -94,6 +99,51 @@ class Receiver:
             self.on_log(f"Не удалось согласовать видео: {exc}")
             self.on_state("error", "Ошибка формата видео. Повторите подключение.")
             await self.close_peer()
+
+    async def watch_video_buffers(self, current, buffers):
+        """Advance the RTP loss deadlines off the packet path; request keyframes."""
+        try:
+            while current is self.peer:
+                await asyncio.sleep(self.RECOVERY_POLL)
+                if current is not self.peer:
+                    break
+                for buffer in buffers:
+                    pli = buffer.expire()
+                    events = buffer.take_events()
+                    if events['expiries'] or events['ssrc']:
+                        self.reset_nack(buffer)
+                    if events['expiries']:
+                        self.on_log(f"Потеря RTP: кадр не собран за "
+                                    f"{buffer.deadline*1000:.0f} мс, запрошен ключевой кадр (PLI)")
+                    if events['recoveries']:
+                        self.on_log("Видеопоток восстановлен с нового ключевого кадра")
+                    if events['ssrc']:
+                        self.on_log("Смена SSRC: таймеры и запросы прежней эпохи отменены")
+                    if pli:
+                        await self.request_keyframe(buffer)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            self.on_log(f"Восстановление видео: {exc}")
+
+    async def request_keyframe(self, buffer):
+        receiver = getattr(buffer, 'receiver', None)
+        ssrc = buffer.last_ssrc
+        if receiver is None or ssrc is None:
+            return
+        try:
+            await receiver._send_rtcp_pli(ssrc)
+        except Exception as exc:
+            self.on_log(f"Не удалось запросить ключевой кадр: {exc}")
+
+    @staticmethod
+    def reset_nack(buffer):
+        """After dropping a damaged epoch, stop asking for its packets."""
+        receiver = getattr(buffer, 'receiver', None)
+        nack = getattr(receiver, '_RTCRtpReceiver__nack_generator', None) if receiver else None
+        if nack is not None:
+            nack.max_seq = None
+            nack.missing.clear()
 
     LABELS = {'stable': 'стабильность, запас 250–350 мс',
               'balanced': 'баланс, запас 120–200 мс',

@@ -200,3 +200,121 @@ class PlayoutBudgetTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(receiver.playout.metrics()['playoutIncompatible'], True)
         finally:
             await receiver.close_peer()
+
+
+class PacketLossRecoveryTests(AioHTTPTestCase):
+    async def get_application(self):
+        self.room = Room()
+        self.frames = []
+        self.first_frames = asyncio.Event()
+        self.states, self.metrics, self.logs = [], [], []
+        loop = asyncio.get_running_loop()
+
+        def record(frame):
+            if frame is not None:
+                self.frames.append(frame)
+                if len(self.frames) >= 8:
+                    self.first_frames.set()
+
+        self.receiver = Receiver(self.room, lambda frame: loop.call_soon_threadsafe(record, frame),
+                                 lambda *args: self.states.append(args),
+                                 self.metrics.append, self.logs.append)
+        self.room.peers['receiver'] = self.receiver
+        return create_app(self.room)
+
+    async def test_lost_rtp_packet_recovers_from_requested_keyframe(self):
+        from fractions import Fraction
+        import av
+        from aiortc import RTCSessionDescription, RTCRtpSender
+        from aiortc.mediastreams import VIDEO_TIME_BASE
+
+        class LumaTrack(VideoStreamTrack):
+            def __init__(self):
+                super().__init__()
+                self.index = 0
+
+            async def recv(self):
+                await asyncio.sleep(1 / 30)
+                frame = av.VideoFrame(320, 180, 'yuv420p')
+                luma = 20 + (self.index % 25) * 7
+                frame.planes[0].update(bytes([luma]) * frame.planes[0].buffer_size)
+                for plane in frame.planes[1:]:
+                    plane.update(bytes([128]) * plane.buffer_size)
+                frame.pts = self.index * 3000
+                frame.time_base = VIDEO_TIME_BASE
+                self.index += 1
+                return frame
+
+        sender = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+        sender.addTrack(LumaTrack())
+        capabilities = [codec for codec in RTCRtpSender.getCapabilities('video').codecs
+                        if codec.mimeType == 'video/H264']
+        self.assertTrue(capabilities)
+        sender.getTransceivers()[0].setCodecPreferences(capabilities)
+        socket = await self.client.ws_connect('/signal')
+        recovered = {'block_rtx': True}
+        try:
+            await socket.send_json({'role': 'sender', 'credential': self.room.code})
+            self.assertEqual((await socket.receive_json(timeout=3))['type'], 'authenticated')
+            self.assertEqual((await socket.receive_json(timeout=3))['type'], 'peer-ready')
+            await sender.setLocalDescription(await sender.createOffer())
+            await socket.send_json({'type': 'offer', 'session': 'loss-test',
+                                    'sdp': sender.localDescription.sdp})
+            answer = await socket.receive_json(timeout=5)
+            self.assertEqual(answer['type'], 'answer')
+            await sender.setRemoteDescription(RTCSessionDescription(type='answer', sdp=answer['sdp']))
+            await asyncio.wait_for(self.first_frames.wait(), timeout=8)
+
+            # Lose one original RTP packet and its RTX retransmissions: the
+            # damaged frame can only be abandoned by the time deadline.
+            rtp_receiver = self.receiver.peer.getReceivers()[0]
+            codecs = getattr(rtp_receiver, '_RTCRtpReceiver__codecs')
+            h264_types = {pt for pt, codec in codecs.items() if codec.mimeType == 'video/H264'}
+            rtx_types = {pt for pt, codec in codecs.items() if codec.mimeType == 'video/rtx'}
+            self.assertTrue(h264_types)
+            original = rtp_receiver._handle_rtp_packet
+            state = {'shoot': True, 'seen': 0, 'dropped': None, 'rtx': 0}
+
+            async def lossy(packet, arrival_time_ms):
+                if recovered['block_rtx'] and packet.payload_type in rtx_types:
+                    state['rtx'] += 1
+                    return
+                if state['shoot'] and packet.payload_type in h264_types:
+                    state['seen'] += 1
+                    if state['seen'] == 3:
+                        state['dropped'] = packet.sequence_number
+                        state['shoot'] = False
+                        return
+                await original(packet, arrival_time_ms)
+
+            rtp_receiver._handle_rtp_packet = lossy
+            loop = asyncio.get_running_loop()
+            limit = loop.time() + 8
+            while state['dropped'] is None:          # wait until the packet loss is real
+                if loop.time() > limit:
+                    self.fail(f'loss was never injected: logs={self.logs}')
+                await asyncio.sleep(.01)
+            limit = loop.time() + 5
+            while not any('PLI' in log for log in self.logs):   # deadline demand for a keyframe
+                if loop.time() > limit:
+                    self.fail(f'no PLI after the RTP loss: logs={self.logs}')
+                await asyncio.sleep(.05)
+            received_before = len(self.frames)
+            limit = loop.time() + 10
+            while len(self.frames) < received_before + 6:       # decoding resumes on the keyframe
+                if loop.time() > limit:
+                    self.fail(f'stream did not resume after loss: frames={len(self.frames)} logs={self.logs}')
+                await asyncio.sleep(.05)
+            recovered['block_rtx'] = False
+            await asyncio.sleep(1.2)   # statistics interval publishes the buffer metrics
+            self.assertTrue(any(metric.get('deadlineExpiries', 0) >= 1 for metric in self.metrics),
+                            self.metrics)
+            self.assertTrue(any(metric.get('pliRequests', 0) >= 1 for metric in self.metrics),
+                            self.metrics)
+            self.assertGreaterEqual(len(self.frames), received_before + 6)
+        finally:
+            recovered['block_rtx'] = False
+            await socket.close()
+            await sender.close()
+        await asyncio.sleep(.05)
+        self.assertIsNone(self.receiver.peer)
