@@ -23,14 +23,23 @@ from PySide6.QtWidgets import (
 )
 
 from .receiver import Receiver
-from .server import Room, create_app, video_settings
+from .server import BASE_PROFILE, Room, create_app, video_settings
 
 PRESETS = {
+    # The experimental 120 fps preset stays selectable but is never a default.
     "Максимум · 120 fps": {"fps": 120, "bitrate": 80, "maxSize": 2560},
     "Стабильность · 30 fps": {"fps": 30, "bitrate": 10, "maxSize": 1920},
+    # Lighter 60 fps profile for weaker machines.
     "Плавность · 60 fps": {"fps": 60, "bitrate": 16, "maxSize": 1920},
-    "Качество · 60 fps": {"fps": 60, "bitrate": 24, "maxSize": 2560},
+    # Base profile of a new session, shared with airframe.server.BASE_PROFILE.
+    "Качество · 60 fps": dict(BASE_PROFILE),
 }
+PROFILE_ACK_TIMEOUT_MS = 10000
+ACK_PENDING = "pending"
+ACK_SAVED = "saved"
+ACK_APPLIED = "applied"
+ACK_REJECTED = "rejected"
+ACK_TIMEOUT = "timeout"
 PLAYOUT_LABELS = {"stable": "стабильность для OBS", "balanced": "баланс", "low": "минимальная задержка"}
 STYLE = """
 QWidget {background:#101216;color:#eef0f3;font-size:12px;}
@@ -176,6 +185,10 @@ class LocalServer:
             raise RuntimeError(f"Не удалось открыть порт {self.port}: {self.error}")
 
     def submit(self, coroutine):
+        if self.loop is None or self.loop.is_closed():
+            # Late GUI/queued events must not touch a stopped server loop.
+            coroutine.close()
+            return None
         future = asyncio.run_coroutine_threadsafe(coroutine, self.loop)
         def completed(f):
             try:
@@ -187,11 +200,18 @@ class LocalServer:
 
     def configure(self, settings, request_id=""):
         async def apply():
-            self.room.settings = video_settings(settings)
-            if "sender" not in self.room.peers:
-                self.events.stats.emit({"configured": {"requestId": request_id, "saved": True}})
+            requested = video_settings(settings)
+            sender_connected = "sender" in self.room.peers
+            # The request is saved for the next connection immediately; while a
+            # phone is connected it becomes effective only after its ack.
+            effective = self.room.request_profile(requested, request_id)
+            if not sender_connected:
+                self.events.stats.emit({"configured": {"requestId": request_id, "saved": True,
+                                                       "settings": effective,
+                                                       "effective": dict(effective)}})
                 return
-            await self.room.send("sender", {"type": "configure", "settings": self.room.settings, "requestId": request_id})
+            await self.room.send("sender", {"type": "configure", "settings": effective,
+                                            "requestId": request_id})
         self.submit(apply())
 
     def set_playout(self, mode):
@@ -404,14 +424,16 @@ class Desktop(QMainWindow):
         ql.addWidget(self.rate_label)
         self.rate = QSlider(Qt.Orientation.Horizontal)
         self.rate.setRange(4,80)
-        self.rate.setValue(10)
         ql.addWidget(self.rate)
         self.apply_button = apply = QPushButton("Применить профиль")
         apply.setObjectName("primary")
         apply.clicked.connect(self.apply_profile)
         ql.addWidget(apply)
         self.profile_result = text("Профиль ещё не отправлен", "muted", True)
-        self.pending_profile = ""
+        self.pending_profile = None
+        self.profile_ack_state = None
+        self.profile_ack_timeout_ms = PROFILE_ACK_TIMEOUT_MS
+        self.confirmed_profile = dict(video_settings(self.server.room.settings))
         self.profile_timeout = QTimer(self)
         self.profile_timeout.setSingleShot(True)
         self.profile_timeout.timeout.connect(self.profile_timed_out)
@@ -423,8 +445,7 @@ class Desktop(QMainWindow):
         self.playout_mode.addItem("Стабильность OBS · 250–350 мс", "stable")
         self.playout_mode.addItem("Баланс · 120–200 мс", "balanced")
         self.playout_mode.addItem("Минимальная задержка · без запаса", "low")
-        self.playout_mode.currentIndexChanged.connect(
-            lambda _: self.server.set_playout(self.playout_mode.currentData()))
+        self.playout_mode.currentIndexChanged.connect(self.playout_selected)
         ql.addWidget(self.playout_mode)
         ql.addWidget(text("Стабильность сглаживает поступление кадров пачками ценой дополнительной задержки. "
                           "Паузы длиннее запаса или пропущенные телефоном кадры могут остаться заметны.","muted",True))
@@ -500,6 +521,7 @@ class Desktop(QMainWindow):
         export.clicked.connect(self.export_log)
         dl.addWidget(export)
         self.diagnostics.setCentralWidget(diag_widget)
+        self.sync_profile_controls()
         self.profile.currentTextChanged.connect(self.select_profile)
         self.rate.valueChanged.connect(self.custom_profile)
         self.target_fps.currentIndexChanged.connect(self.custom_profile)
@@ -557,22 +579,52 @@ class Desktop(QMainWindow):
             self.server.rotate()
         self.expires.setText(f"Код действует ещё {max(0,int(remaining))//60}:{max(0,int(remaining))%60:02d}")
 
+    def sync_profile_controls(self, settings=None):
+        """Show a profile in the controls without emitting edit signals.
+
+        Used both for the initial session profile and for the profile the phone
+        actually reports after an acknowledgement, so the window always shows
+        the effective settings rather than a wish.
+        """
+        settings = video_settings(self.server.room.settings if settings is None else settings)
+        for field in (self.target_fps,self.max_size,self.rate):
+            field.blockSignals(True)
+        self.target_fps.setCurrentIndex(self.target_fps.findData(settings["fps"]))
+        self.max_size.setCurrentIndex(self.max_size.findData(settings["maxSize"]))
+        self.rate.setValue(settings["bitrate"])
+        for field in (self.target_fps,self.max_size,self.rate):
+            field.blockSignals(False)
+        name = next((name for name, profile in PRESETS.items() if profile == settings), "Свой профиль")
+        self.profile.blockSignals(True)
+        self.profile.setCurrentText(name)
+        self.profile.blockSignals(False)
+        self.rate_label.setText(f"Битрейт: максимум {self.rate.value()} Мбит/с")
+        return settings
+
     def select_profile(self, name):
         if name not in PRESETS:
             return
-        profile = PRESETS[name]
-        for field in (self.target_fps,self.max_size,self.rate):
-            field.blockSignals(True)
-        self.target_fps.setCurrentIndex(self.target_fps.findData(profile["fps"]))
-        self.max_size.setCurrentIndex(self.max_size.findData(profile["maxSize"]))
-        self.rate.setValue(profile["bitrate"])
-        for field in (self.target_fps,self.max_size,self.rate):
-            field.blockSignals(False)
-        self.rate_label.setText(f"Битрейт: максимум {self.rate.value()} Мбит/с")
+        self.sync_profile_controls(PRESETS[name])
 
     def custom_profile(self,*args):
+        # Editing a field means the session preset no longer describes the profile.
+        self.profile.blockSignals(True)
         self.profile.setCurrentText("Свой профиль")
+        self.profile.blockSignals(False)
         self.rate_label.setText(f"Битрейт: максимум {self.rate.value()} Мбит/с")
+
+    def select_playout_mode(self, mode):
+        """Select a playout mode by its stable value low/balanced/stable, not by index."""
+        index = self.playout_mode.findData(mode)
+        if index < 0:
+            raise ValueError(f"Unknown playout mode: {mode}")
+        self.playout_mode.setCurrentIndex(index)
+        return mode
+
+    def playout_selected(self, _index):
+        mode = self.playout_mode.currentData()
+        if mode is not None:
+            self.server.set_playout(mode)
 
     def volume_moved(self, value):
         if time.monotonic() - self.volume_sent_at < .150:
@@ -589,20 +641,71 @@ class Desktop(QMainWindow):
         self.log("Звук телефона: " + ("захват включён" if enabled else "захват выключен"))
 
     def apply_profile(self):
-        settings = {"fps":self.target_fps.currentData(),
-                    "maxSize":self.max_size.currentData(),"bitrate":self.rate.value()}
+        settings = video_settings({"fps":self.target_fps.currentData(),
+                                   "maxSize":self.max_size.currentData(),
+                                   "bitrate":self.rate.value()})
         self.pending_profile = secrets.token_hex(8)
+        self.profile_ack_state = ACK_PENDING
         self.profile_result.setText("Ожидаем подтверждение от телефона…")
         self.apply_button.setEnabled(False)
-        self.profile_timeout.start(10000)
+        self.profile_timeout.start(self.profile_ack_timeout_ms)
         self.server.configure(settings, self.pending_profile)
         self.log(f"Профиль: до {settings['fps']} fps, {settings['maxSize']} px, до {settings['bitrate']} Мбит/с")
 
-    def profile_timed_out(self):
+    def profile_ack(self, result):
+        """Reflect the phone's acknowledgement; only the pending request counts.
+
+        saved  - the profile is stored for the next connection, not applied now;
+        applied - the phone accepted it (this does not prove 60 FPS, only that
+                  setParameters() was accepted);
+        rejected - the phone refused it: keep showing the effective profile.
+        """
+        if not self.pending_profile or result.get("requestId") != self.pending_profile:
+            return
+        self.profile_timeout.stop()
         self.apply_button.setEnabled(True)
-        self.profile_result.setText("Телефон не подтвердил профиль. Обновите APK и повторите.")
+        if result.get("saved") is True:
+            self.profile_ack_state = ACK_SAVED
+            effective = video_settings(result.get("effective") or result.get("settings")
+                                       or self.confirmed_profile)
+            self.confirmed_profile = effective
+            self.pending_profile = None
+            self.sync_profile_controls(effective)
+            message = "Сохранено. Применится при подключении телефона."
+        elif result.get("applied") is True:
+            self.profile_ack_state = ACK_APPLIED
+            effective = video_settings(result.get("effective") or result.get("settings")
+                                       or self.confirmed_profile)
+            self.confirmed_profile = effective
+            self.pending_profile = None
+            self.sync_profile_controls(effective)
+            message = (f"Телефон подтвердил профиль: до {effective['fps']} fps, "
+                       f"{effective['maxSize']} px, до {effective['bitrate']} Мбит/с. "
+                       "Фактические fps зависят от телефона, сети и компьютера.")
+        else:
+            # A rejection is never shown as applied; the previous effective
+            # profile stays in the session and in the controls.
+            self.profile_ack_state = ACK_REJECTED
+            effective = video_settings(result.get("effective") or self.confirmed_profile)
+            self.pending_profile = None
+            self.sync_profile_controls(effective)
+            message = (f"Телефон отклонил профиль. Действует прежний профиль: до {effective['fps']} fps, "
+                       f"{effective['maxSize']} px, до {effective['bitrate']} Мбит/с. Обновите APK и повторите.")
+        self.profile_result.setText(message)
+        self.log(message)
+
+    def profile_timed_out(self):
+        self.profile_ack_state = ACK_TIMEOUT
+        self.apply_button.setEnabled(True)
+        seconds = max(1, self.profile_ack_timeout_ms // 1000)
+        message = (f"Телефон не подтвердил профиль за {seconds} с. Профиль сохранён и применится "
+                   "при следующем подключении; проверьте APK и повторите.")
+        self.profile_result.setText(message)
+        self.log(message)
 
     def on_state(self,state,detail):
+        if getattr(self, "closing", False):
+            return
         names={"idle":"Ожидание телефона","connecting":"Подключение","live":"В эфире","retry":"Восстановление","error":"Нужно внимание"}
         self.status.setText("●  "+names.get(state,state))
         self.status.setStyleSheet("color:"+("#ffb2a2" if state=="error" else "#b6f5a1"))
@@ -619,19 +722,7 @@ class Desktop(QMainWindow):
             self.log("Режим вывода применён: " + PLAYOUT_LABELS.get(stats["playoutChanged"], stats["playoutChanged"]))
             return
         if "configured" in stats:
-            result = stats["configured"]
-            if result.get("requestId") != self.pending_profile:
-                return
-            self.profile_timeout.stop()
-            self.apply_button.setEnabled(True)
-            if result.get("saved"):
-                message = "Сохранено. Применится при подключении телефона."
-            elif result.get("applied"):
-                message = "Телефон подтвердил применение профиля."
-            else:
-                message = "Кодировщик телефона отклонил профиль."
-            self.profile_result.setText(message)
-            self.log(message)
+            self.profile_ack(stats["configured"])
             return
         self.fps.setText(f"{stats['fps']:.0f}" if stats else "—")
         self.bitrate.setText(f"{stats['bitrate']:.1f}" if stats else "—")

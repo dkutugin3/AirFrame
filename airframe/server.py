@@ -11,7 +11,12 @@ import time
 from aiohttp import WSMsgType, web
 
 STATE = web.AppKey("state", object)
-DEFAULTS = {"fps": 120, "bitrate": 80, "maxSize": 2560}
+# Base profile of a new session: 60 FPS / 2560 px long side / at most 24 Mbit/s,
+# with the stable OBS playout mode. 120 FPS stays an explicit experimental
+# choice, never a default. The lighter 60/16/1920 profile remains selectable for
+# weaker machines. The Android sender mirrors these defaults (configure()).
+BASE_PROFILE = {"fps": 60, "bitrate": 24, "maxSize": 2560}
+DEFAULTS = dict(BASE_PROFILE)
 
 
 def video_settings(value):
@@ -32,6 +37,9 @@ class Room:
         self.resume_until = 0.0
         self.peers = {}
         self.settings = dict(DEFAULTS)
+        # A profile requested while a sender is connected is only effective once
+        # the phone acknowledges it; until then the previous profile is kept.
+        self.pending_profile = None
         self.failures = defaultdict(deque)
         self.total_failures = deque()
         self.rotate_code()
@@ -66,6 +74,39 @@ class Room:
         if len(self.failures) > 512:
             self.failures.clear()
         return False
+
+    def request_profile(self, settings, request_id=""):
+        """Validate a receiver-requested profile and remember what it replaces.
+
+        The request is saved right away for the next connection; while a sender
+        is connected it becomes effective only after acknowledge_profile().
+        """
+        settings = video_settings(settings)
+        previous = dict(self.settings)
+        self.settings = settings
+        self.pending_profile = ({"requestId": request_id, "previous": previous}
+                                if "sender" in self.peers else None)
+        return settings
+
+    def acknowledge_profile(self, message):
+        """Reconcile the phone's acknowledgement with the effective profile.
+
+        An acknowledgement for an unknown/stale request cannot change the
+        session profile. A rejection keeps the previously effective profile; an
+        applied change adopts the settings the phone actually reports.
+        """
+        pending = self.pending_profile
+        if pending is None or message.get("requestId") != pending["requestId"]:
+            return None
+        self.pending_profile = None
+        if message.get("applied") is True:
+            try:
+                self.settings = video_settings(message.get("settings"))
+            except ValueError:
+                self.settings = video_settings(pending["previous"])
+        else:
+            self.settings = video_settings(pending["previous"])
+        return dict(self.settings)
 
     async def send(self, role, message):
         peer = self.peers.get(role)
@@ -191,11 +232,14 @@ async def signal(request):
             if not isinstance(message, dict):
                 raise ValueError("Invalid message")
             if message.get("type") == "configure" and role == "receiver":
-                room.settings = video_settings(message.get("settings"))
-                await room.send("sender", {"type": "configure", "settings": room.settings, "requestId": str(message.get("requestId", ""))[:64]})
+                request_id = str(message.get("requestId", ""))[:64]
+                settings = room.request_profile(message.get("settings"), request_id)
+                await room.send("sender", {"type": "configure", "settings": settings, "requestId": request_id})
             elif message.get("type") == "stop" and role == "receiver":
                 await room.send("sender", {"type": "stop"})
             elif validate_signal(role, message):
+                if message.get("type") == "configured" and role == "sender":
+                    room.acknowledge_profile(message)
                 await room.send(other, message)
             else:
                 raise ValueError("Unsupported signaling message")
@@ -206,6 +250,7 @@ async def signal(request):
             del room.peers[role]
             if role == "sender":
                 room.resume_until = time.monotonic() + 600
+                room.pending_profile = None
             await room.send("receiver" if role == "sender" else "sender", {"type": "peer-left"})
         await ws.close()
     return ws
