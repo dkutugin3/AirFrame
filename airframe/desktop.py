@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import render as video_render
+from .adaptive import AdaptiveQuality
 from .receiver import Receiver
 from .server import (BASE_PROFILE, Room, TelemetrySampler, create_app,
                      format_telemetry_lines, telemetry_bottleneck, video_settings)
@@ -527,6 +528,14 @@ class Desktop(QMainWindow):
         self.profile_timeout.setSingleShot(True)
         self.profile_timeout.timeout.connect(self.profile_timed_out)
         ql.addWidget(self.profile_result)
+        self.smoothness = QCheckBox("Плавность: снижать 2560→1920 px при устойчивом "
+                                    "ограничении кодировщика")
+        self.smoothness.setChecked(False)
+        self.smoothness.toggled.connect(self.smoothness_toggled)
+        ql.addWidget(self.smoothness)
+        self.adaptive = AdaptiveQuality(base=video_settings(dict(self.server.room.saved_profile)),
+                                        floor=1920, priority="quality")
+        self.adaptive_now = time.monotonic
         ql.addWidget(text("Плавность вывода", "eyebrow"))
         self.playout_mode = QComboBox()
         self.playout_mode.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
@@ -746,10 +755,32 @@ class Desktop(QMainWindow):
         self.server.set_audio(enabled)
         self.log("Звук телефона: " + ("захват включён" if enabled else "захват выключен"))
 
+    def smoothness_toggled(self, checked):
+        self.adaptive.priority = "smoothness" if checked else "quality"
+        self.adaptive.rearm(video_settings(dict(self.server.room.saved_profile)))
+        self.log("Приоритет: " + ("плавность (управляемое снижение 2560→1920)" if checked
+                                 else "качество (разрешение не снижается)"))
+
+    def adaptive_observe(self, stats):
+        """Feed the 1 Hz sender telemetry to the compromise controller."""
+        if not stats or "encodedFps" not in stats:
+            return
+        action = self.adaptive.observe(limited=stats.get("limitation", "unknown"),
+                                       encoded_fps=stats.get("encodedFps", 0.0),
+                                       now=self.adaptive_now())
+        if action is None:
+            return
+        self.log("Адаптация: " + action["reason"])
+        if action["action"] == "configure":
+            self.server.configure(action["settings"], "adaptive-" + secrets.token_hex(4))
+        else:
+            self.profile_result.setText(action["reason"])
+
     def apply_profile(self):
         settings = video_settings({"fps":self.target_fps.currentData(),
                                    "maxSize":self.max_size.currentData(),
                                    "bitrate":self.rate.value()})
+        self.adaptive.manual_override(video_settings(settings))
         self.pending_profile = secrets.token_hex(8)
         self.profile_ack_state = ACK_PENDING
         self.profile_result.setText("Ожидаем подтверждение от телефона…")
@@ -888,6 +919,7 @@ class Desktop(QMainWindow):
                 self.phone_volume.setValue(int(volume))
         self.volume_value.setText(f"{int(volume)}%" if volume is not None else "—")
         self.loss.setText(f"Потери: {stats['loss']:.1f}% · {size} · приём включает WebRTC overhead{sender_detail}{telemetry_detail}{pipeline_detail}" if stats else "Потери: — · размер: —")
+        self.adaptive_observe(stats)
         self._refresh_output_diag()
 
     def eventFilter(self, obj, event):
