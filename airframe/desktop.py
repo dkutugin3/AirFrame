@@ -23,7 +23,8 @@ from PySide6.QtWidgets import (
 )
 
 from .receiver import Receiver
-from .server import BASE_PROFILE, Room, create_app, video_settings
+from .server import (BASE_PROFILE, Room, TelemetrySampler, create_app,
+                     format_telemetry_lines, telemetry_bottleneck, video_settings)
 
 PRESETS = {
     # The experimental 120 fps preset stays selectable but is never a default.
@@ -434,6 +435,9 @@ class Desktop(QMainWindow):
         self.profile_ack_state = None
         self.profile_ack_timeout_ms = PROFILE_ACK_TIMEOUT_MS
         self.confirmed_profile = dict(video_settings(self.server.room.settings))
+        self.telemetry = TelemetrySampler()
+        self.last_bottleneck = None
+        self.telemetry_logged_at = 0.0
         self.profile_timeout = QTimer(self)
         self.profile_timeout.setSingleShot(True)
         self.profile_timeout.timeout.connect(self.profile_timed_out)
@@ -713,6 +717,9 @@ class Desktop(QMainWindow):
         self.stop.setEnabled(state in ("live","connecting","retry"))
         if state == "connecting":
             self.server.set_audio(self.audio_capture.isChecked())
+            # New media session: cumulative telemetry counters restart.
+            self.telemetry.reset()
+            self.last_bottleneck = None
         self.log(detail)
 
     def on_stats(self,stats):
@@ -752,13 +759,33 @@ class Desktop(QMainWindow):
                                 f" · восстановлений буфера: {stats.get('bufferRecoveries',0)}")
         sender_detail = (f" · кодировщик: {stats['encodedFps']:.0f} fps, {stats['width']} × {stats['height']}"
                          f" · ограничение: {stats['limitation']}" if "encodedFps" in stats else "")
+        telemetry_detail = ""
+        if stats:
+            try:
+                target_fps = video_settings(self.server.room.settings)["fps"]
+            except ValueError:
+                target_fps = 60
+            rates = self.telemetry.update(stats)
+            lines = format_telemetry_lines(stats, rates, received_fps=stats.get("fps"),
+                                           target_fps=target_fps)
+            telemetry_detail = "\n" + "\n".join(lines)
+            bottleneck = telemetry_bottleneck(stats, rates, received_fps=stats.get("fps"),
+                                              target_fps=target_fps)
+            now = time.monotonic()
+            if bottleneck != self.last_bottleneck or now - self.telemetry_logged_at >= 5:
+                # Journal export is the diagnostics report; log transitions and a
+                # periodic summary instead of one line per statistics tick.
+                self.last_bottleneck = bottleneck
+                self.telemetry_logged_at = now
+                for line in lines:
+                    self.log(line)
         volume = stats.get("volume") if stats else None
         if not self.volume_dragging:
             self.phone_volume.setEnabled(volume is not None)
             if volume is not None:
                 self.phone_volume.setValue(int(volume))
         self.volume_value.setText(f"{int(volume)}%" if volume is not None else "—")
-        self.loss.setText(f"Потери: {stats['loss']:.1f}% · {size} · приём включает WebRTC overhead{sender_detail}{pipeline_detail}" if stats else "Потери: — · размер: —")
+        self.loss.setText(f"Потери: {stats['loss']:.1f}% · {size} · приём включает WebRTC overhead{sender_detail}{telemetry_detail}{pipeline_detail}" if stats else "Потери: — · размер: —")
 
     def open_obs(self):
         self.obs.show()
