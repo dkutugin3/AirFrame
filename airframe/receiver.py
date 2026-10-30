@@ -1,5 +1,6 @@
 """Native WebRTC video reception; no browser, STUN, TURN, or cloud services."""
 import asyncio
+import contextlib
 import time
 
 import av
@@ -7,6 +8,7 @@ from aiortc import RTCConfiguration, RTCPeerConnection, RTCSessionDescription
 from aiortc.mediastreams import MediaStreamError
 from aiortc.sdp import candidate_from_sdp
 
+from .codec_capabilities import CapabilityError, h264_high_receive_capabilities
 from .decode import install_decoder_pipelines
 from .h264 import advertise_answer_level, level_name, rewrite_profile_level_id
 from .transport import VIDEO_LOSS_DEADLINE, install_video_buffers
@@ -108,7 +110,9 @@ class Receiver:
                 self.phone_audio(channel)
 
         try:
-            await current.setRemoteDescription(RTCSessionDescription(sdp=message["sdp"], type="offer"))
+            with self.high_profile_negotiation():
+                await current.setRemoteDescription(
+                    RTCSessionDescription(sdp=message["sdp"], type="offer"))
             self.video_buffers = install_video_buffers(current)
             self.decode_pipelines = install_decoder_pipelines(
                 current, asyncio.get_running_loop(), fps=self.room.settings["fps"])
@@ -124,6 +128,33 @@ class Receiver:
             self.on_log(f"Не удалось согласовать видео: {exc}")
             self.on_state("error", "Ошибка формата видео. Повторите подключение.")
             await self.close_peer()
+
+    @contextlib.contextmanager
+    def high_profile_negotiation(self):
+        """Expose H.264 High/Constrained High receive entries for this negotiation.
+
+        aiortc 1.15.0 lists only Baseline/Constrained Baseline receive codecs, so a
+        High-profile offer is rejected during ``setRemoteDescription``. The entries
+        are added for exactly this call and removed again afterwards, so the
+        receiver gains the capability without changing sender-side offers in the
+        same process. The bitstream is still decoded by aiortc's normal H.264
+        decoder. Any failure keeps the Baseline fallback instead of breaking the
+        session.
+        """
+        try:
+            manager = h264_high_receive_capabilities()
+            added = manager.__enter__()
+        except CapabilityError as exc:
+            self.on_log(f"H.264 High: расширение приёма недоступно ({exc}); остаётся Baseline")
+            yield
+            return
+        try:
+            if added:
+                self.on_log("H.264: приём поддерживает " + ", ".join(added)
+                            + "; Baseline остаётся запасным профилем")
+            yield
+        finally:
+            manager.__exit__(None, None, None)
 
     def declared_answer(self, sdp):
         """Declare an H.264 level that covers the configured receive profile.
