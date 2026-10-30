@@ -111,6 +111,127 @@ def git_state():
     return state
 
 
+_CG = None
+_CF = None
+
+
+def _core_graphics():
+    """Load CoreGraphics/CoreFoundation helpers for on-screen window enumeration."""
+    global _CG, _CF
+    if _CG is not None:
+        return _CG, _CF
+    import ctypes
+    import ctypes.util
+    cg = ctypes.CDLL(ctypes.util.find_library('CoreGraphics'))
+    cf = ctypes.CDLL(ctypes.util.find_library('CoreFoundation'))
+    cf.CFStringCreateWithCString.restype = ctypes.c_void_p
+    cf.CFStringCreateWithCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
+                                             ctypes.c_uint32]
+    cf.CFDictionaryGetValue.restype = ctypes.c_void_p
+    cf.CFDictionaryGetValue.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    cf.CFArrayGetCount.restype = ctypes.c_long
+    cf.CFArrayGetCount.argtypes = [ctypes.c_void_p]
+    cf.CFArrayGetValueAtIndex.restype = ctypes.c_void_p
+    cf.CFArrayGetValueAtIndex.argtypes = [ctypes.c_void_p, ctypes.c_long]
+    cf.CFNumberGetValue.restype = ctypes.c_ubyte
+    cf.CFNumberGetValue.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_void_p]
+    cf.CFStringGetCString.restype = ctypes.c_ubyte
+    cf.CFStringGetCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p,
+                                      ctypes.c_long, ctypes.c_uint32]
+    cg.CGWindowListCopyWindowInfo.restype = ctypes.c_void_p
+    cg.CGWindowListCopyWindowInfo.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+    _CG, _CF = cg, cf
+    return _CG, _CF
+
+
+def onscreen_windows():
+    """Front-to-back list of on-screen windows (owner name, title, bounds in points)."""
+    cg, cf = _core_graphics()
+    import ctypes
+    utf8 = 0x08000100
+
+    def key(name):
+        return cf.CFStringCreateWithCString(None, name.encode(), utf8)
+
+    def number(reference):
+        if not reference:
+            return None
+        value = ctypes.c_double()
+        return value.value if cf.CFNumberGetValue(reference, 13,
+                                                  ctypes.byref(value)) else None
+
+    def text(reference):
+        if not reference:
+            return None
+        buffer = ctypes.create_string_buffer(1024)
+        if cf.CFStringGetCString(reference, buffer, 1024, utf8):
+            return buffer.value.decode('utf-8', 'replace')
+        return None
+
+    keys = {name: key(name) for name in ('kCGWindowOwnerPID', 'kCGWindowNumber',
+                                         'kCGWindowLayer', 'kCGWindowBounds',
+                                         'kCGWindowOwnerName', 'kCGWindowName')}
+    array = cg.CGWindowListCopyWindowInfo(1 | 16, 0)  # on-screen, no desktop elements
+    windows = []
+    for index in range(cf.CFArrayGetCount(array)):
+        info = cf.CFArrayGetValueAtIndex(array, index)
+        bounds_ref = cf.CFDictionaryGetValue(info, keys['kCGWindowBounds'])
+        bounds = None
+        if bounds_ref:
+            bounds = [number(cf.CFDictionaryGetValue(bounds_ref, key(axis)))
+                      for axis in ('X', 'Y', 'Width', 'Height')]
+        windows.append({
+            'pid': int(number(cf.CFDictionaryGetValue(info, keys['kCGWindowOwnerPID'])) or 0),
+            'id': int(number(cf.CFDictionaryGetValue(info, keys['kCGWindowNumber'])) or 0),
+            'layer': int(number(cf.CFDictionaryGetValue(info, keys['kCGWindowLayer'])) or 0),
+            'owner': text(cf.CFDictionaryGetValue(info, keys['kCGWindowOwnerName'])),
+            'name': text(cf.CFDictionaryGetValue(info, keys['kCGWindowName'])),
+            'bounds': [round(value, 1) for value in bounds] if bounds else None,
+        })
+    return windows
+
+
+def display_preflight(obs):
+    """Verify the OBS window is on the currently visible display Space.
+
+    A full-screen app (another Space) makes `CGWindowListOptionOnScreenOnly` hide every
+    desktop window, so an external recorder would capture that app instead of AirFrame.
+    Returns (available, detail) and never mutates other applications.
+    """
+    geometry = obs.frameGeometry()
+    expected = [geometry.x(), geometry.y(), geometry.width(), geometry.height()]
+    windows = onscreen_windows()
+    own = [window for window in windows
+           if window['pid'] == os.getpid() and window['layer'] == 0]
+    matched = None
+    for window in own:
+        bounds = window['bounds']
+        if bounds and abs(bounds[0] - expected[0]) <= 4 and abs(bounds[1] - expected[1]) <= 4 \
+                and abs(bounds[2] - expected[2]) <= 4 and abs(bounds[3] - expected[3]) <= 4:
+            matched = window
+            break
+    frontmost = [window for window in windows if window['layer'] == 0][:6]
+    detail = {'obsWindow': matched, 'ownOnscreenWindows': own,
+              'frontmostWindows': frontmost, 'expectedBounds': expected,
+              'screen': [obs.screen().geometry().width(), obs.screen().geometry().height()]
+                        if obs.screen() else None}
+    if matched is not None:
+        return True, detail
+    reasons = []
+    for window in frontmost:
+        if window['bounds'] and detail['screen']:
+            bounds = window['bounds']
+            if (abs(bounds[2] - detail['screen'][0]) <= 4
+                    and abs(bounds[3] - detail['screen'][1]) <= 4):
+                reasons.append(f"full-screen window from '{window['owner']}'"
+                               f" ({window['name'] or 'untitled'}) occupies the display")
+    reason = ('OBS window is not on the active display Space: ' + '; '.join(reasons)) \
+        if reasons else ('OBS window is not on the active display Space (another app/space '
+                         'is in front)')
+    detail['reason'] = reason
+    return False, detail
+
+
 def write_json(path, payload):
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     Path(path).write_text(json.dumps(payload, indent=2, default=str, allow_nan=False),
@@ -559,6 +680,14 @@ def run_live(args):
         stats.clear()  # capture-window statistics only
         rect = window_content_rect(obs, app_state['app'])
         report['capture']['window'] = rect
+        display_ok, display_detail = display_preflight(obs)
+        report['capture']['display'] = display_detail
+        if not display_ok:
+            report['status'] = 'capture-unavailable'
+            report['failClosedReason'] = display_detail['reason']
+            write_json(out_dir / 'acceptance-60fps-report.json', report)
+            log('FAIL CLOSED: ' + report['failClosedReason'])
+            return 2
         if (rect['width'] <= 0 or rect['height'] <= 0
                 or rect['x'] < 0 or rect['y'] < 0
                 or rect['x'] + rect['width'] > rect['screenWidth']
@@ -595,6 +724,14 @@ def run_live(args):
             return 2
         log('capture probe verified: external recording contains decodable frame IDs')
 
+        display_ok, display_detail = display_preflight(obs)
+        report['capture']['displayBeforeCapture'] = display_detail
+        if not display_ok:
+            report['status'] = 'capture-unavailable'
+            report['failClosedReason'] = display_detail['reason']
+            write_json(out_dir / 'acceptance-60fps-report.json', report)
+            log('FAIL CLOSED: ' + report['failClosedReason'])
+            return 2
         movie = out_dir / 'acceptance-60fps-capture.mp4'
         recorder_state = {}
         recording = record_window(args, recorder, rect, args.duration, movie,
