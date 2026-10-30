@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 ROOT=Path(__file__).resolve().parents[1]
+ARTIFACTS=Path(os.environ.get('AIRFRAME_ARTIFACTS_DIR',ROOT/'artifacts/2026-10-30-stable60fps/smoke'))
 if not os.environ.get('AIRFRAME_SMOKE_BUNDLED'):sys.path.insert(0,str(ROOT))
 from aiohttp import ClientSession
 from aiortc import RTCConfiguration,RTCPeerConnection,RTCSessionDescription,VideoStreamTrack,RTCRtpSender
@@ -77,7 +78,7 @@ try:
     report['maxOutputGapMs']=round(max(m.get('outputGapMs',0) for m in metrics),2)
     report['playoutUnderflows']=max(m.get('playoutUnderflows',0) for m in metrics)
     report['targetMs']=max(m.get('playoutTargetMs',0) for m in metrics)
-    out=ROOT/('artifacts/v0.3.0/jitter-qa.json' if JITTER else 'artifacts/v0.3.0/motion-qa.json');out.parent.mkdir(parents=True,exist_ok=True)
+    out=ARTIFACTS/('jitter-qa.json' if JITTER else 'motion-qa.json');out.parent.mkdir(parents=True,exist_ok=True)
     out.write_text(json.dumps(report,indent=2))
     print(('Burst/225ms pauses: ' if JITTER else '')+'Synthetic 1920x880 H264 motion / target 60 fps:',json.dumps(report),flush=True)
     assert report['fps']>=55 and report['nativePaintFps']>=55,'Slow synthetic pipeline; see report'
