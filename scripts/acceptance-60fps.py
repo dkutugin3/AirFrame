@@ -91,6 +91,26 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
+def git_state():
+    """Exact revision/dirty state under test (the branch is shared and keeps moving)."""
+    state = {'head': None, 'dirty': None, 'branch': None}
+    try:
+        head = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=ROOT,
+                              capture_output=True, text=True, timeout=10)
+        state['head'] = head.stdout.strip() or None
+        branch = subprocess.run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=ROOT,
+                                capture_output=True, text=True, timeout=10)
+        state['branch'] = branch.stdout.strip() or None
+        status = subprocess.run(['git', 'status', '--porcelain'], cwd=ROOT,
+                                capture_output=True, text=True, timeout=10)
+        lines = [line for line in status.stdout.splitlines() if line.strip()]
+        state['dirty'] = len(lines)
+        state['dirtyFiles'] = [line[3:] for line in lines[:20]]
+    except Exception as error:  # pragma: no cover - diagnostics only
+        state['error'] = repr(error)
+    return state
+
+
 def write_json(path, payload):
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     Path(path).write_text(json.dumps(payload, indent=2, default=str, allow_nan=False),
@@ -473,7 +493,8 @@ def run_live(args):
     out_dir.mkdir(parents=True, exist_ok=True)
     report = {'schema': 'airframe-acceptance-60fps/1', 'mode': 'live',
               'startedAt': now_iso(), 'command': ' '.join(sys.argv),
-              'host': {'platform': sys.platform, 'python': sys.version.split()[0]},
+              'host': {'platform': sys.platform, 'python': sys.version.split()[0],
+                       'git': git_state()},
               'config': vars(args)}
     # Native dependencies needed by the app are installed outside .venv by
     # scripts/setup-native-tests.sh and injected via PYTHONPATH (documented).
@@ -609,6 +630,36 @@ def run_live(args):
             except Exception as error:  # pragma: no cover - shutdown diagnostics
                 log(f'cleanup warning: {error!r}')
             del app_state
+    # ----- actual output path / renderer / decoder observability -----
+    output_path_info = {}
+    try:
+        window = app_state['window']
+        obs_renderer = window.obs_pane.renderer
+        preview_renderer = window.surface.renderer
+        decoder_status = {}
+        try:
+            receiver = app_state['server'].receiver
+            pipeline = getattr(receiver, 'decode_pipeline', None)
+            if pipeline is not None:
+                decoder_status['pipelineStats'] = pipeline.stats()
+            if hasattr(pipeline, 'decoder'):
+                decoder_status['decoder'] = repr(pipeline.decoder)
+        except Exception as error:  # pragma: no cover - diagnostics only
+            decoder_status['error'] = repr(error)
+        output_path_info = {
+            'obsOutputPath': obs_renderer.output_path(),
+            'previewOutputPath': preview_renderer.output_path(),
+            'obsRendererStats': obs_renderer.stats(),
+            'previewRendererStats': preview_renderer.stats(),
+            'obsRhiBackend': getattr(obs_renderer, 'rhi_backend', lambda: None)(),
+            'obsFallbackReason': obs_renderer.fallback_reason,
+            'decoder': decoder_status,
+            'decoderNote': ('default decoder factory is aiortc/FFmpeg software unless a '
+                            'hardware factory is wired in; reported from the live pipeline'),
+        }
+    except Exception as error:  # pragma: no cover - diagnostics only
+        output_path_info = {'error': repr(error)}
+
     # ----- process CPU accounting (ps is blocked in this sandbox) -----
     children_final = resource.getrusage(resource.RUSAGE_CHILDREN)
     children_cpu = ((children_final.ru_utime - children_baseline.ru_utime)
@@ -643,6 +694,15 @@ def run_live(args):
     summary['captureSpanSeconds'] = analysis['spanSeconds']
     summary['nominalSeconds'] = args.duration
     report['recordingAnalysis'] = summary
+    report['outputPath'] = output_path_info
+    without_ids = summary['framesWithoutId']
+    contamination = None
+    if summary['framesCaptured'] and without_ids > max(2, .02 * summary['framesCaptured']):
+        contamination = (
+            f'{without_ids}/{summary["framesCaptured"]} captured frames had no decodable '
+            f'frame ID: the OBS window was covered, frozen or otherwise contaminated '
+            f'(another benchmark window?) - recording must not be used as acceptance evidence')
+    report['capture']['contaminationSuspected'] = contamination
     report['appUsage'] = {'self': summarize_usage(app_usage), 'recorder': recorder_usage}
     report['appStats'] = {
         'samples': len(stats),
