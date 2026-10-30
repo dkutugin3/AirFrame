@@ -219,6 +219,17 @@ class BoundedDecodedQueue:
         self.bytes -= size
         return frame
 
+    async def put(self, frame):
+        """Compatibility hook: ignore aiortc's old decoder-worker end signal.
+
+        ``RTCRtpReceiver._stop_decoder()`` finishes aiortc's own decoder thread with
+        ``run_coroutine_threadsafe(output_q.put(None), loop)`` on the track queue it
+        captured at start-up. The pipeline owns the decoded handoff now, so that
+        legacy end signal is a no-op here: closing the handoff would kill the live
+        queue during ``attach()``. Shutdown is signalled by ``close()`` instead.
+        """
+        return None
+
     def close(self):
         self.closed = True
         dropped = self.frames

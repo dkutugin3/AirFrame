@@ -140,6 +140,19 @@ class BoundedQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(queue.get())               # pending work is drained on close
         self.assertTrue(queue.closed)
 
+    async def test_aiortc_worker_end_signal_is_ignored_by_decoded_handoff(self):
+        """When aiortc's own decoder thread is stopped during pipeline attach it
+        publishes its end sentinel as `run_coroutine_threadsafe(output_q.put(None))`
+        on the captured track queue. The pipeline owns the handoff, so that legacy
+        signal must be accepted as a no-op and must not close a live queue."""
+        queue = BoundedDecodedQueue(max_frames=4, max_bytes=1 << 20)
+        self.assertTrue(queue.put_nowait(Picture(pts=1, id=1)))
+        self.assertIsNone(await queue.put(None))
+        self.assertFalse(queue.closed)
+        self.assertEqual(queue.frames, 1)
+        received = await queue.get()
+        self.assertEqual(received.id, 1)
+
     async def test_decoded_handoff_keeps_whole_supported_burst_not_latest_only(self):
         clock = FakeClock()
         queue = BoundedDecodedQueue(max_frames=decoded_limits(60), max_bytes=1 << 26, clock=clock)
