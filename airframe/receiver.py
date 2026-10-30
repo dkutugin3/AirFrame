@@ -11,6 +11,14 @@ from .decode import install_decoder_pipelines
 from .h264 import advertise_answer_level, level_name, rewrite_profile_level_id
 from .transport import VIDEO_LOSS_DEADLINE, install_video_buffers
 from .playout import Playout
+from .server import TELEMETRY_FLOAT_BOUNDS, TELEMETRY_INT_BOUNDS, TELEMETRY_TEXT_LIMITS
+
+# Additive sender-telemetry keys already bounded by server.telemetry_valid.
+# The receiver forwards only these known measurements: absent fields stay
+# absent (never a fabricated 0) and unknown extra keys never reach stats.
+TELEMETRY_OPTIONAL_KEYS = tuple(sorted(
+    {*TELEMETRY_FLOAT_BOUNDS, *TELEMETRY_INT_BOUNDS, *TELEMETRY_TEXT_LIMITS,
+     "hardwareEncoder", "thermalStatus"}))
 
 
 class Receiver:
@@ -53,9 +61,14 @@ class Receiver:
             await self.close_peer()
             self.on_state("idle", "Телефон отключился. Ожидаем повторного подключения.")
         elif kind == "telemetry" and message["session"] == self.session:
-            self.sender_stats = {k: message[k] for k in ("encodedFps", "width", "height", "limitation")}
+            stats = {k: message[k] for k in ("encodedFps", "width", "height", "limitation")}
             if "volume" in message:
-                self.sender_stats["volume"] = message["volume"]
+                stats["volume"] = message["volume"]
+            # Stage 5b: pass validated optional measurements through to on_stats.
+            for key in TELEMETRY_OPTIONAL_KEYS:
+                if key in message:
+                    stats[key] = message[key]
+            self.sender_stats = stats
         elif kind == "configured":
             self.on_stats({"configured": message})
         elif kind == "offer":

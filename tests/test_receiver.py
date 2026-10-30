@@ -536,3 +536,134 @@ class AnswerLevelTests(AioHTTPTestCase):
         finally:
             await socket.close()
             await sender.close()
+
+
+# --- Stage 5b: additive telemetry must reach on_stats/sender_stats -------------
+TELEMETRY_LEGACY = {"type": "telemetry", "session": "telemetry-session",
+                    "encodedFps": 60, "width": 2560, "height": 1440,
+                    "limitation": "none"}
+TELEMETRY_OPTIONAL = {
+    "captureFps": 59.5, "maxCaptureIntervalMs": 34.2, "pacerFps": 60,
+    "framesEncoded": 1200, "framesSent": 1190, "videoBitrateKbps": 21500,
+    "avgEncodeTimeMs": 7.4, "codec": "H264", "codecProfile": "42e01f",
+    "encoderImplementation": "c2.android.avc.encoder", "hardwareEncoder": "unknown",
+    "thermalStatus": "light", "captureWidth": 2560, "captureHeight": 1440,
+    "telemetryWindowMs": 1000, "sampledMonotonicMs": 123456,
+}
+TELEMETRY_OPTIONAL_KEYS = set(TELEMETRY_OPTIONAL)
+
+
+class TelemetryPassThroughTests(unittest.IsolatedAsyncioTestCase):
+    """The receiver passes validated optional telemetry through without inventing data."""
+
+    def make_receiver(self):
+        self.states, self.stats, self.logs = [], [], []
+        receiver = Receiver(Room(), lambda frame: None,
+                            lambda *args: self.states.append(args),
+                            self.stats.append, self.logs.append)
+        receiver.session = "telemetry-session"
+        return receiver
+
+    async def test_old_telemetry_payload_still_accepted(self):
+        receiver = self.make_receiver()
+        await receiver.send_json({**TELEMETRY_LEGACY, "volume": 42})
+        self.assertEqual(receiver.sender_stats,
+                         {"encodedFps": 60, "width": 2560, "height": 1440,
+                          "limitation": "none", "volume": 42})
+
+    async def test_optional_telemetry_fields_reach_sender_stats(self):
+        receiver = self.make_receiver()
+        await receiver.send_json({**TELEMETRY_LEGACY, **TELEMETRY_OPTIONAL,
+                                  "volume": 42, "junk": "must not reach stats"})
+        expected = {"encodedFps": 60, "width": 2560, "height": 1440,
+                    "limitation": "none", "volume": 42, **TELEMETRY_OPTIONAL}
+        self.assertEqual(receiver.sender_stats, expected)
+        # Only known, server-validated fields are forwarded (bounded stats dict).
+        self.assertNotIn("junk", receiver.sender_stats)
+
+    async def test_absent_optional_fields_stay_absent(self):
+        receiver = self.make_receiver()
+        await receiver.send_json(dict(TELEMETRY_LEGACY))
+        self.assertEqual(set(receiver.sender_stats),
+                         {"encodedFps", "width", "height", "limitation"})
+        for key in TELEMETRY_OPTIONAL_KEYS:
+            self.assertNotIn(key, receiver.sender_stats)
+
+    async def test_first_sample_counter_reset_and_new_session(self):
+        receiver = self.make_receiver()
+        # First sample: raw cumulative counters, no delta/rate invented by the receiver.
+        await receiver.send_json({**TELEMETRY_LEGACY, "framesEncoded": 1200,
+                                  "framesSent": 1190, "sampledMonotonicMs": 1000})
+        self.assertIn("framesEncoded", receiver.sender_stats)
+        self.assertEqual(receiver.sender_stats["framesEncoded"], 1200)
+        self.assertEqual(receiver.sender_stats["framesSent"], 1190)
+        # Counter reset (new session / re-encoded stream): raw values stay raw;
+        # deriving rates and detecting the reset is the desktop sampler's job.
+        await receiver.send_json({**TELEMETRY_LEGACY, "framesEncoded": 5,
+                                  "framesSent": 4, "sampledMonotonicMs": 1020})
+        self.assertIn("framesEncoded", receiver.sender_stats)
+        self.assertEqual(receiver.sender_stats["framesEncoded"], 5)
+        self.assertEqual(receiver.sender_stats["framesSent"], 4)
+        # A new media session clears stale sender stats; telemetry of the old
+        # session is ignored, telemetry of the new session is accepted.
+        await receiver.close_peer()
+        self.assertEqual(receiver.sender_stats, {})
+        receiver.session = "next-telemetry-session"
+        await receiver.send_json(dict(TELEMETRY_LEGACY))
+        self.assertEqual(receiver.sender_stats, {})
+        await receiver.send_json({**TELEMETRY_LEGACY, "session": "next-telemetry-session",
+                                  "captureFps": 60})
+        self.assertIn("captureFps", receiver.sender_stats)
+        self.assertEqual(receiver.sender_stats["captureFps"], 60)
+
+
+class TelemetrySignalingTests(AioHTTPTestCase):
+    """End-to-end: sender telemetry over real signaling reaches receiver on_stats."""
+
+    async def get_application(self):
+        self.room = Room()
+        self.metrics, self.logs = [], []
+        self.receiver = Receiver(self.room, lambda frame: None, lambda *args: None,
+                                 self.metrics.append, self.logs.append)
+        self.room.peers['receiver'] = self.receiver
+        return create_app(self.room)
+
+    async def test_telemetry_reaches_on_stats_through_signaling(self):
+        from aiortc import RTCSessionDescription
+        sender = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+        sender.addTrack(VideoStreamTrack())
+        socket = await self.client.ws_connect('/signal')
+        try:
+            await socket.send_json({'role': 'sender', 'credential': self.room.code})
+            self.assertEqual((await socket.receive_json(timeout=3))['type'], 'authenticated')
+            self.assertEqual((await socket.receive_json(timeout=3))['type'], 'peer-ready')
+            await sender.setLocalDescription(await sender.createOffer())
+            await socket.send_json({'type': 'offer', 'session': 'telemetry-e2e',
+                                    'sdp': sender.localDescription.sdp})
+            answer = await socket.receive_json(timeout=5)
+            self.assertEqual(answer['type'], 'answer')
+            await sender.setRemoteDescription(
+                RTCSessionDescription(type='answer', sdp=answer['sdp']))
+            await socket.send_json({**TELEMETRY_LEGACY, **TELEMETRY_OPTIONAL,
+                                    "session": "telemetry-e2e", "volume": 42,
+                                    "junk": "must not reach stats"})
+            # The receiver merges sender_stats into the periodic on_stats sample.
+            for _ in range(250):
+                if any(isinstance(stat, dict) and "captureFps" in stat
+                       for stat in self.metrics):
+                    break
+                await asyncio.sleep(.02)
+            else:
+                self.fail(f"telemetry never reached on_stats: {self.metrics[-3:]}")
+            stats = next(stat for stat in self.metrics
+                         if isinstance(stat, dict) and "captureFps" in stat)
+            self.assertEqual(stats["captureFps"], 59.5)
+            self.assertEqual(stats["framesEncoded"], 1200)
+            self.assertEqual(stats["encodedFps"], 60)
+            self.assertEqual(stats["volume"], 42)
+            self.assertNotIn("junk", stats)
+        finally:
+            await socket.close()
+            await sender.close()
+        await asyncio.sleep(.05)
+        self.assertIsNone(self.receiver.peer)
