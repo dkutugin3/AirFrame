@@ -154,6 +154,8 @@ def validate_signal(role, message):
                 and len(message["requestId"]) <= 64)
     if kind == "volume" and role == "receiver":
         return type(message.get("value")) is int and 0 <= message["value"] <= 100
+    if kind == "audio" and role == "receiver":
+        return type(message.get("enabled")) is bool
     return kind == "restart" and role == "receiver"
 
 

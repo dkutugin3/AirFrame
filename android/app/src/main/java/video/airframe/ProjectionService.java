@@ -1,5 +1,6 @@
 package video.airframe;
 
+import android.app.Activity;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
@@ -7,7 +8,11 @@ import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
+import android.media.AudioAttributes;
+import android.media.AudioFormat;
 import android.media.AudioManager;
+import android.media.AudioPlaybackCaptureConfiguration;
+import android.media.AudioRecord;
 import android.media.projection.MediaProjection;
 import android.net.wifi.WifiManager;
 import android.os.Build;
@@ -20,6 +25,7 @@ import android.view.WindowManager;
 
 import org.json.JSONObject;
 import org.webrtc.*;
+import org.webrtc.audio.JavaAudioDeviceModule;
 import okhttp3.*;
 
 import java.util.ArrayList;
@@ -41,6 +47,10 @@ public class ProjectionService extends Service {
     private VideoTrack track;
     private PeerConnection peer;
     private RtpSender sender;
+    private AudioSource audioSource;
+    private AudioTrack audioTrack;
+    private org.webrtc.audio.AudioDeviceModule audioDeviceModule;
+    private volatile boolean audioEnabled=true;
     private PowerManager.WakeLock wake;
     private WifiManager.WifiLock wifi;
     private AudioManager audio;
@@ -118,10 +128,17 @@ public class ProjectionService extends Service {
             audio=(AudioManager)getSystemService(AUDIO_SERVICE);
             PeerConnectionFactory.initialize(PeerConnectionFactory.InitializationOptions.builder(this).createInitializationOptions());
             egl=EglBase.create();
-            factory=PeerConnectionFactory.builder()
+            audioDeviceModule=buildCaptureModule(intent.getIntExtra("resultCode", Activity.RESULT_OK),permission);
+            PeerConnectionFactory.Builder factoryBuilder=PeerConnectionFactory.builder()
                     .setVideoEncoderFactory(new DefaultVideoEncoderFactory(egl.getEglBaseContext(),true,true))
-                    .setVideoDecoderFactory(new DefaultVideoDecoderFactory(egl.getEglBaseContext()))
-                    .createPeerConnectionFactory();
+                    .setVideoDecoderFactory(new DefaultVideoDecoderFactory(egl.getEglBaseContext()));
+            if(audioDeviceModule!=null)factoryBuilder.setAudioDeviceModule(audioDeviceModule);
+            factory=factoryBuilder.createPeerConnectionFactory();
+            if(audioDeviceModule!=null){
+                audioSource=factory.createAudioSource(new MediaConstraints());
+                audioTrack=factory.createAudioTrack("airframe-audio",audioSource);
+                audioTrack.setEnabled(audioEnabled);
+            }
             texture=SurfaceTextureHelper.create("AirFrame-capture",egl.getEglBaseContext());
             source=factory.createVideoSource(true);
             capturer=new ScreenCapturerAndroid(permission,new MediaProjection.Callback(){
@@ -146,6 +163,35 @@ public class ProjectionService extends Service {
             main.post(statistics);
         }catch(Exception e){status="Ошибка запуска: "+e.getMessage();stopSelf();}
         return START_NOT_STICKY;
+    }
+
+    /** Feed Android 10+ playback capture into WebRTC instead of the microphone. */
+    private org.webrtc.audio.AudioDeviceModule buildCaptureModule(int resultCode,Intent permission) {
+        if(Build.VERSION.SDK_INT<29)return null;
+        try{
+            MediaProjectionManager manager=(MediaProjectionManager)getSystemService(MEDIA_PROJECTION_SERVICE);
+            MediaProjection projection=manager.getMediaProjection(resultCode,permission);
+            if(projection==null)return null;
+            AudioRecord capture=new AudioRecord.Builder()
+                    .setAudioFormat(new AudioFormat.Builder()
+                            .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                            .setSampleRate(48000)
+                            .setChannelMask(AudioFormat.CHANNEL_IN_MONO).build())
+                    .setBufferSizeInBytes(4096)
+                    .setAudioPlaybackCaptureConfig(new AudioPlaybackCaptureConfiguration.Builder(projection)
+                            .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                            .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                            .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN).build())
+                    .build();
+            return JavaAudioDeviceModule.builder(getApplicationContext())
+                    .setAudioSource(capture)
+                    .setSampleRate(48000)
+                    .setUseHardwareAcousticEchoCanceler(false)
+                    .setUseHardwareNoiseSuppressor(false)
+                    .createAudioDeviceModule();
+        }catch(Exception error){
+            return null;   // Audio capture is optional; video keeps working without it.
+        }
     }
 
     private int[] captureSize(int width,int height) {
@@ -249,6 +295,10 @@ public class ProjectionService extends Service {
                 break;
             case "restart":scheduleRestart();break;
             case "volume":setPhoneVolume(message.optInt("value",50));break;
+            case "audio":
+                audioEnabled=message.optBoolean("enabled");
+                if(audioTrack!=null)audioTrack.setEnabled(audioEnabled);
+                break;
             case "peer-left":closePeer();status="Окно приёмника закрыто. Ожидание…";break;
             case "stop":status="Трансляция завершена с компьютера";stopSelf();break;
             case "error":status=message.optString("message","Ошибка подключения");stopSelf();break;
@@ -290,10 +340,13 @@ public class ProjectionService extends Service {
         });
         if(peer==null){status="Не удалось создать WebRTC сеанс";stopSelf();return;}
         sender=peer.addTrack(track,Collections.singletonList("airframe"));
+        if(audioTrack!=null)peer.addTrack(audioTrack,Collections.singletonList("airframe"));
         // Prefer hardware H.264; keep VP8/VP9 as negotiated fallbacks.
         List<RtpCapabilities.CodecCapability> codecs=new ArrayList<>(factory.getRtpSenderCapabilities(MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO).codecs);
         codecs.sort((a,b)->Boolean.compare(!a.name.equalsIgnoreCase("H264"),!b.name.equalsIgnoreCase("H264")));
-        for(RtpTransceiver transceiver:peer.getTransceivers())transceiver.setCodecPreferences(codecs);
+        for(RtpTransceiver transceiver:peer.getTransceivers())
+            if(transceiver.getMediaType()==MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO)
+                transceiver.setCodecPreferences(codecs);
         configure(json("fps",fps,"bitrate",bitrate,"maxSize",maxSize));
         final PeerConnection current=peer;
         current.createOffer(new Sdp(){@Override public void onCreateSuccess(SessionDescription sdp){main.post(()->{
@@ -335,6 +388,9 @@ public class ProjectionService extends Service {
         if(socket!=null){socket.close(1000,"Stopped");socket=null;}
         closePeer();
         if(capturer!=null){try{capturer.stopCapture();}catch(Exception ignored){}capturer.dispose();}
+        if(audioTrack!=null)audioTrack.dispose();
+        if(audioSource!=null)audioSource.dispose();
+        if(audioDeviceModule!=null)audioDeviceModule.release();
         if(track!=null)track.dispose();
         if(source!=null)source.dispose();
         if(texture!=null)texture.dispose();

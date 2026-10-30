@@ -85,7 +85,7 @@ public class MainActivity extends Activity {
         column.addView(stop);
         status = addText(column, ProjectionService.status, 15, "#B6F5A1");
         addText(column, "Разрешите захват экрана в системном диалоге. При блокировке телефона Android может завершить захват — тогда потребуется новое разрешение.", 13, "#9299A5");
-        addText(column, "Частота кадров (30–120), битрейт и качество задаются на компьютере. Для высоких fps предпочтительна сеть 5 или 6 ГГц; для 120 fps нужен экран 120 Гц. Звук и управление телефоном в этой версии не передаются.", 13, "#9299A5");
+        addText(column, "Частота кадров (30–120), битрейт и качество задаются на компьютере. Для высоких fps предпочтительна сеть 5 или 6 ГГц; для 120 fps нужен экран 120 Гц. Звук телефона включается на компьютере (Android 10+); управление телефоном не передаётся.", 13, "#9299A5");
         setContentView(scroll);
     }
 
@@ -137,7 +137,8 @@ public class MainActivity extends Activity {
         if(pendingAddress==null || pendingCode==null) {status.setText("Повторите подключение");return;}
         getPreferences(MODE_PRIVATE).edit().putString("address",pendingAddress).apply();
         Intent service=new Intent(this,ProjectionService.class)
-                .putExtra("permission",data).putExtra("address",pendingAddress).putExtra("code",pendingCode);
+                .putExtra("permission",data).putExtra("resultCode",result)
+                .putExtra("address",pendingAddress).putExtra("code",pendingCode);
         startForegroundService(service);
         pendingCode=null; code.setText("");
     }

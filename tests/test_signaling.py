@@ -23,6 +23,13 @@ class SettingsTests(unittest.TestCase):
             self.assertFalse(validate_signal("receiver",bad),bad)
         self.assertFalse(validate_signal("sender",{"type":"volume","value":50}))
 
+    def test_audio_commands(self):
+        for enabled in (True,False):
+            self.assertTrue(validate_signal("receiver",{"type":"audio","enabled":enabled}))
+        for bad in ({"type":"audio","enabled":"yes"},{"type":"audio"},{"type":"audio","enabled":1}):
+            self.assertFalse(validate_signal("receiver",bad),bad)
+        self.assertFalse(validate_signal("sender",{"type":"audio","enabled":True}))
+
     def test_code_expiry_and_strong_reconnect_token(self):
         room=Room(); code=room.code
         self.assertTrue(room.authenticate("sender",code,"phone"))

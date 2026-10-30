@@ -11,9 +11,10 @@ from .playout import Playout
 
 
 class Receiver:
-    def __init__(self, room, on_frame, on_state, on_stats, on_log, playout_mode="stable"):
+    def __init__(self, room, on_frame, on_state, on_stats, on_log, on_audio=None, playout_mode="stable"):
         self.room = room
         self.on_frame, self.on_state, self.on_stats, self.on_log = on_frame, on_state, on_stats, on_log
+        self.on_audio = on_audio
         self.peer = None
         self.session = ""
         self.tasks = set()
@@ -78,6 +79,8 @@ class Receiver:
         def track_received(track):
             if track.kind == "video":
                 self.task(self.frames(current, track))
+            elif track.kind == "audio" and self.on_audio is not None:
+                self.task(self.audio(current, track))
 
         try:
             await current.setRemoteDescription(RTCSessionDescription(sdp=message["sdp"], type="offer"))
@@ -101,6 +104,20 @@ class Receiver:
             self.playout_changed.set()
         self.on_stats({"playoutChanged": mode})
         self.on_log("Вывод: " + self.LABELS.get(mode, mode))
+
+    async def audio(self, current, track):
+        """Opus arrives as 48 kHz frames; hand packed s16 stereo to the audio sink."""
+        try:
+            while current is self.peer:
+                frame = await track.recv()
+                if current is not self.peer:
+                    break
+                pcm = frame.reformat(format="s16", layout="stereo")
+                self.on_audio(bytes(pcm.planes[0]))
+        except MediaStreamError:
+            pass
+        except Exception as exc:
+            self.on_log(f"Ошибка звука: {exc}")
 
     async def frames(self, current, track):
         self.playout.reset(fps=self.room.settings["fps"])

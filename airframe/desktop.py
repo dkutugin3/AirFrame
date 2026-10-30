@@ -14,9 +14,10 @@ import shiboken6
 from aiohttp import web
 from PySide6.QtCore import QObject, QRect, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QAction, QColor, QFont, QImage, QPainter
+from PySide6.QtMultimedia import QAudioFormat, QAudioSink
 from PySide6.QtNetwork import QAbstractSocket, QNetworkInterface
 from PySide6.QtWidgets import (
-    QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
+    QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
     QLayout, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSlider,
     QVBoxLayout, QWidget,
 )
@@ -104,9 +105,40 @@ class Frames:
             return self.serial, self.image
 
 
+class AudioOut(QObject):
+    """Plays WebRTC phone audio on the default output; OBS captures it as desktop audio."""
+    pushed = Signal(bytes)
+
+    def __init__(self):
+        super().__init__()
+        fmt = QAudioFormat()
+        fmt.setSampleRate(48000)
+        fmt.setChannelCount(2)
+        fmt.setSampleFormat(QAudioFormat.SampleFormat.Int16)
+        self.sink = QAudioSink(fmt)
+        self.sink.setBufferSize(16384)
+        self.io = None
+        self.pushed.connect(self.write, Qt.ConnectionType.QueuedConnection)
+
+    def put(self, data):
+        self.pushed.emit(data)
+
+    @Slot(bytes)
+    def write(self, data):
+        if self.io is None:
+            self.io = self.sink.start()
+        self.io.write(data)
+
+    def stop(self):
+        self.pushed.disconnect(self.write)
+        if self.io is not None:
+            self.sink.stop()
+            self.io = None
+
+
 class LocalServer:
-    def __init__(self, port, events, frames):
-        self.port, self.events, self.frames = port, events, frames
+    def __init__(self, port, events, frames, audio=None):
+        self.port, self.events, self.frames, self.audio = port, events, frames, audio
         self.room = Room()
         self.receiver = None
         self.started = threading.Event()
@@ -120,7 +152,8 @@ class LocalServer:
             self.loop = asyncio.get_running_loop()
             self.stop_event = asyncio.Event()
             self.receiver = Receiver(self.room, self.frames.put, self.events.state.emit,
-                                     self.events.stats.emit, self.events.log.emit)
+                                     self.events.stats.emit, self.events.log.emit,
+                                     self.audio.put if self.audio else None)
             self.room.peers["receiver"] = self.receiver
             runner = web.AppRunner(create_app(self.room), access_log=None)
             try:
@@ -169,6 +202,11 @@ class LocalServer:
     def set_volume(self, value):
         async def change():
             await self.room.send("sender", {"type": "volume", "value": value})
+        self.submit(change())
+
+    def set_audio(self, enabled):
+        async def change():
+            await self.room.send("sender", {"type": "audio", "enabled": enabled})
         self.submit(change())
 
     def stop_stream(self):
@@ -407,7 +445,14 @@ class Desktop(QMainWindow):
         self.phone_volume.sliderMoved.connect(self.volume_moved)
         ql.addWidget(text("Мультимедиа-громкость подключённого телефона. Ползунок синхронизируется, "
                           "если менять звук на самом телефоне.","muted",True))
-        ql.addWidget(text("WebRTC адаптирует передачу к сети. Сам звук телефона не передаётся; громкость регулируется выше.","muted",True))
+        self.audio_capture = QCheckBox("Захватывать звук телефона")
+        self.audio_capture.setChecked(True)
+        self.audio_capture.toggled.connect(self.audio_toggled)
+        ql.addWidget(self.audio_capture)
+        ql.addWidget(text("Звук телефона воспроизводится на этом компьютере и попадает в OBS как звук "
+                          "рабочего стола. Требуется Android 10+ и разрешение захвата. Звук звонков "
+                          "и запретившие захват приложения не передаются.","muted",True))
+        ql.addWidget(text("WebRTC адаптирует передачу к сети; звук и видео идут одним зашифрованным потоком.","muted",True))
         right.addWidget(quality)
         self.stop = QPushButton("■  Завершить трансляцию")
         self.stop.setEnabled(False)
@@ -427,7 +472,7 @@ class Desktop(QMainWindow):
         body.addWidget(right_area)
         layout.addLayout(body,1)
         footer = QHBoxLayout()
-        footer.addWidget(text("AIRFRAME 0.4.0   ·   НАТИВНЫЙ ПРИЁМНИК","muted"))
+        footer.addWidget(text("AIRFRAME 0.5.0   ·   НАТИВНЫЙ ПРИЁМНИК","muted"))
         footer.addStretch()
         diagnostics = QPushButton("Диагностика и инструкция")
         diagnostics.clicked.connect(self.show_diagnostics)
@@ -539,6 +584,10 @@ class Desktop(QMainWindow):
         self.volume_dragging = False
         self.server.set_volume(self.phone_volume.value())
 
+    def audio_toggled(self, enabled):
+        self.server.set_audio(enabled)
+        self.log("Звук телефона: " + ("захват включён" if enabled else "захват выключен"))
+
     def apply_profile(self):
         settings = {"fps":self.target_fps.currentData(),
                     "maxSize":self.max_size.currentData(),"bitrate":self.rate.value()}
@@ -559,6 +608,8 @@ class Desktop(QMainWindow):
         self.status.setStyleSheet("color:"+("#ffb2a2" if state=="error" else "#b6f5a1"))
         self.detail.setText(detail)
         self.stop.setEnabled(state in ("live","connecting","retry"))
+        if state == "connecting":
+            self.server.set_audio(self.audio_capture.isChecked())
         self.log(detail)
 
     def on_stats(self,stats):
@@ -641,6 +692,8 @@ class Desktop(QMainWindow):
         self.closing = True
         self.obs.hide()
         self.diagnostics.hide()
+        if self.server.audio is not None:
+            self.server.audio.stop()
         self.server.close()
         event.accept()
 
@@ -653,7 +706,8 @@ def main():
     app.setApplicationName("AirFrame")
     app.setStyle("Fusion")
     events,frames=Events(),Frames()
-    server=LocalServer(args.port,events,frames)
+    audio=AudioOut()
+    server=LocalServer(args.port,events,frames,audio)
     try:
         server.start()
     except RuntimeError as exc:
