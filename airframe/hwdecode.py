@@ -49,6 +49,7 @@ from fractions import Fraction
 
 import av
 import av.codec.hwaccel as av_hwaccel
+from aiortc.codecs import get_decoder as aiortc_get_decoder
 
 from .transport import H264_NAL_IDR, h264_nal_types
 
@@ -155,10 +156,11 @@ def _to_packet(encoded_frame):
     return packet
 
 
-def _packet_is_idr(packet):
+def _frame_is_idr(encoded_frame):
     try:
-        return H264_NAL_IDR in h264_nal_types(bytes(packet))
-    except Exception:  # pragma: no cover - malformed packet: let the decoder judge
+        data = bytes(encoded_frame) if isinstance(encoded_frame, av.Packet) else getattr(encoded_frame, "data", b"")
+        return H264_NAL_IDR in h264_nal_types(data)
+    except Exception:  # pragma: no cover - malformed frame: let the decoder judge
         return False
 
 
@@ -196,7 +198,8 @@ class H264HardwareDecoder:
     name = "h264-hardware"
 
     def __init__(self, device_type=DEFAULT_DEVICE, mode=MODE_HARDWARE,
-                 context_factory=None, clock=time.monotonic, log=None):
+                 context_factory=None, clock=time.monotonic, log=None,
+                 codec=None, software_factory=None):
         if mode not in (MODE_HARDWARE, MODE_SOFTWARE):
             raise ValueError(f"decoder instance mode must be hardware/software, not {mode!r}")
         self.device_type = device_type
@@ -205,8 +208,11 @@ class H264HardwareDecoder:
         self.status = DecoderStatus(mode, device_type)
         self._hardware = None
         self._software = None
+        self._raw_software = None
         self._awaiting_keyframe = False
         self._context_factory = context_factory
+        self.codec = codec
+        self._software_factory = software_factory
         self._make_software()
         if mode == MODE_SOFTWARE:
             return
@@ -220,9 +226,35 @@ class H264HardwareDecoder:
 
     # ---- contexts ---------------------------------------------------------
     def _make_software(self):
-        self._software = av.CodecContext.create("h264", "r")
+        """Software decoder identical to aiortc's default for the negotiated codec.
+
+        The factory is looked up lazily through ``airframe.decode.get_decoder`` so
+        the stage-4 integration point (including its test injection) still governs
+        the software path; without a negotiated codec a plain PyAV context is used.
+        """
+        if self.codec is not None:
+            if self._software_factory is None:
+                from . import decode as decode_layer
+                self._software_factory = decode_layer.get_decoder
+            self._software = self._software_factory(self.codec)
+            self._raw_software = None
+        else:
+            self._software = None
+            self._raw_software = av.CodecContext.create("h264", "r")
         self._awaiting_keyframe = False
         self.status["awaitingKeyframe"] = False
+
+    def _software_decode(self, encoded_frame):
+        if self._software is not None:
+            try:
+                return self._software.decode(encoded_frame)
+            except av.FFmpegError:
+                return []
+        packet = _to_packet(encoded_frame)
+        try:
+            return self._raw_software.decode(packet)
+        except av.FFmpegError:
+            return []
 
     @staticmethod
     def _create_hardware(device_type, context_factory=None):
@@ -256,24 +288,21 @@ class H264HardwareDecoder:
     def decode(self, encoded_frame):
         if self.status["closed"]:
             return []
-        packet = _to_packet(encoded_frame)
         if self._hardware is not None:
+            packet = _to_packet(encoded_frame)
             try:
                 frames = self._hardware.decode(packet)
             except av.FFmpegError as exc:
-                return self._hardware_failed(str(exc), packet)
+                return self._hardware_failed(str(exc), encoded_frame)
             self._count(frames, hardware=True)
             return frames
         if self._awaiting_keyframe:
-            if not _packet_is_idr(packet):
+            if not _frame_is_idr(encoded_frame):
                 self.status["droppedAwaitingKeyframe"] += 1
                 return []
             self._awaiting_keyframe = False
             self.status["awaitingKeyframe"] = False
-        try:
-            frames = self._software.decode(packet)
-        except av.FFmpegError:
-            return []
+        frames = self._software_decode(encoded_frame)
         self._count(frames, hardware=False)
         return frames
 
@@ -289,7 +318,7 @@ class H264HardwareDecoder:
         else:
             self.status["softwareFrames"] += count
 
-    def _hardware_failed(self, reason, packet):
+    def _hardware_failed(self, reason, encoded_frame):
         """Fall back to a fresh software decoder and restart at the next IDR."""
         self.status["hardwareFailures"] += 1
         self.status["fallbacks"] += 1
@@ -301,17 +330,14 @@ class H264HardwareDecoder:
         )
         self._log(self.status["reason"])
         self._hardware = None
-        # Fresh software context: the old one never saw a complete hardware epoch.
+        # Fresh software decoder: the old one never saw a complete hardware epoch.
         self._make_software()
-        if not _packet_is_idr(packet):
+        if not _frame_is_idr(encoded_frame):
             self._awaiting_keyframe = True
             self.status["awaitingKeyframe"] = True
             return []
         # The failing access unit was an IDR: software can restart on it right away.
-        try:
-            frames = self._software.decode(packet)
-        except av.FFmpegError:
-            return []
+        frames = self._software_decode(encoded_frame)
         self._count(frames, hardware=False)
         return frames
 
@@ -320,6 +346,7 @@ class H264HardwareDecoder:
             return
         self._hardware = None
         self._software = None
+        self._raw_software = None
         self._awaiting_keyframe = False
         self.status["closed"] = True
         self.status["awaitingKeyframe"] = False
@@ -328,6 +355,7 @@ class H264HardwareDecoder:
         """Reopen decode after reconnect/resolution change (releases both contexts)."""
         self._hardware = None
         self._software = None
+        self._raw_software = None
         self._awaiting_keyframe = False
         self.status["closed"] = False
         self._make_software()
@@ -391,8 +419,21 @@ class DecoderFactory:
                 reason=f"hardware H.264 decode unavailable: {probe_result.reason or 'not verified'}",
             )
 
+    @staticmethod
+    def _is_h264(codec):
+        mime = str(getattr(codec, "mimeType", "") or "").lower()
+        name = str(getattr(codec, "name", "") or "").lower()
+        return mime == "video/h264" or name == "h264"
+
     def __call__(self, codec=None):
-        """DecodePipeline calls this once per codec; returns an aiortc-style decoder."""
+        """DecodePipeline calls this once per codec; returns an aiortc-style decoder.
+
+        Only H.264 is handled here. Any other negotiated video codec (VP8/VP9) is
+        delegated to aiortc's own decoder, so the software behaviour stays
+        byte-identical for codecs this stage does not touch.
+        """
+        if codec is not None and not self._is_h264(codec):
+            return aiortc_get_decoder(codec)
         mode = self.status["selectedMode"]
         decoder = H264HardwareDecoder(
             device_type=self.device_type,
@@ -400,6 +441,7 @@ class DecoderFactory:
             context_factory=None,
             clock=self.clock,
             log=self._log,
+            codec=codec,
         )
         self.decoders.append(decoder)
         return decoder

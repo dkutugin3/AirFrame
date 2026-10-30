@@ -16,7 +16,11 @@ import unittest
 import av
 
 import airframe.hwdecode as hw
+from aiortc.rtcrtpparameters import RTCRtpCodecParameters
 from airframe.decode import DecodePipeline
+
+H264_CODEC = RTCRtpCodecParameters(mimeType="video/H264", clockRate=90000, payloadType=96)
+VP8_CODEC = RTCRtpCodecParameters(mimeType="video/VP8", clockRate=90000, payloadType=97)
 
 REAL_PROBE = hw.probe_h264_hwaccel()
 
@@ -263,7 +267,7 @@ class SelectionTests(unittest.TestCase):
 
     def test_forced_software_never_creates_hardware(self):
         factory = hw.select_decoder_factory(hw.MODE_SOFTWARE)
-        decoder = factory(object())
+        decoder = factory(H264_CODEC)
         self.assertEqual(decoder.status["actualMode"], hw.MODE_SOFTWARE)
         self.assertEqual(decoder.status["requestedMode"], hw.MODE_SOFTWARE)
         self.assertIsNone(factory.probe)
@@ -273,7 +277,7 @@ class SelectionTests(unittest.TestCase):
         factory = hw.select_decoder_factory(hw.MODE_HARDWARE, probe=self._verified)
         self.assertEqual(factory.status["selectedMode"], hw.MODE_HARDWARE)
         self.assertTrue(factory.status["hardwareVerified"])
-        decoder = factory(object())
+        decoder = factory(H264_CODEC)
         self.assertEqual(decoder.status["actualMode"], hw.MODE_HARDWARE)
         decoder.close()
 
@@ -281,7 +285,7 @@ class SelectionTests(unittest.TestCase):
         factory = hw.select_decoder_factory(hw.MODE_HARDWARE, probe=self._not_engaged)
         self.assertEqual(factory.status["selectedMode"], hw.MODE_SOFTWARE)
         self.assertIn("did not engage", factory.status["reason"])
-        decoder = factory(object())
+        decoder = factory(H264_CODEC)
         self.assertEqual(decoder.status["actualMode"], hw.MODE_SOFTWARE)
         self.assertNotEqual(decoder.status["actualMode"], hw.MODE_HARDWARE,
                             "software must never be labelled hardware")
@@ -294,6 +298,15 @@ class SelectionTests(unittest.TestCase):
         opted_in = hw.select_decoder_factory(hw.MODE_AUTO, probe=self._verified,
                                              prefer_hardware=True)
         self.assertEqual(opted_in.status["selectedMode"], hw.MODE_HARDWARE)
+
+    def test_non_h264_codecs_stay_on_the_aiortc_decoder(self):
+        """VP8/VP9 must be delegated to aiortc unchanged, even in hardware mode."""
+        factory = hw.select_decoder_factory(hw.MODE_HARDWARE, probe=self._verified)
+        decoder = factory(VP8_CODEC)
+        from aiortc.codecs.vpx import Vp8Decoder
+
+        self.assertNotIsInstance(decoder, hw.H264HardwareDecoder)
+        self.assertIsInstance(decoder, Vp8Decoder)
 
     def test_env_opt_in_for_hardware(self):
         previous = os.environ.get("AIRFRAME_HW_DECODE")
@@ -322,6 +335,27 @@ class Stage4IntegrationPointTests(unittest.TestCase):
             pipeline.close()
         finally:
             loop.close()
+
+    def test_software_path_honours_the_stage4_get_decoder_injection(self):
+        """The stage-4 injection point (airframe.decode.get_decoder) still governs software."""
+        import airframe.decode as decode_module
+
+        original = decode_module.get_decoder
+        calls = []
+
+        class MarkerDecoder:
+            def decode(self, frame):
+                calls.append(frame)
+                return []
+
+        decode_module.get_decoder = lambda codec: MarkerDecoder()
+        try:
+            decoder = hw.H264HardwareDecoder(mode=hw.MODE_SOFTWARE, codec=H264_CODEC)
+            decoder.decode(Jitter(stream(320, 180)[0][0]))
+        finally:
+            decode_module.get_decoder = original
+            decoder.close()
+        self.assertEqual(len(calls), 1)
 
     def test_install_decoder_pipelines_accepts_the_factory(self):
         import inspect

@@ -10,6 +10,7 @@ from aiortc.sdp import candidate_from_sdp
 
 from .codec_capabilities import CapabilityError, h264_high_receive_capabilities
 from .decode import install_decoder_pipelines
+from .hwdecode import select_decoder_factory
 from .h264 import advertise_answer_level, level_name, rewrite_profile_level_id
 from .transport import VIDEO_LOSS_DEADLINE, install_video_buffers
 from .playout import Playout
@@ -37,6 +38,7 @@ class Receiver:
         self.video_buffers = []
         self.decode_pipelines = []
         self.decode_pipeline = None
+        self.decoder_factory = None
         self.closed = False
         self.frame_count = 0
         self.sender_stats = {}
@@ -114,8 +116,11 @@ class Receiver:
                 await current.setRemoteDescription(
                     RTCSessionDescription(sdp=message["sdp"], type="offer"))
             self.video_buffers = install_video_buffers(current)
+            # Stage 7: auto = verified software on this pinned stack (see hwdecode).
+            self.decoder_factory = select_decoder_factory(getattr(self.room, "decoder_mode", None))
             self.decode_pipelines = install_decoder_pipelines(
-                current, asyncio.get_running_loop(), fps=self.room.settings["fps"])
+                current, asyncio.get_running_loop(), fps=self.room.settings["fps"],
+                decoder_factory=self.decoder_factory)
             self.decode_pipeline = self.decode_pipelines[0] if self.decode_pipelines else None
             self.task(self.watch_video_buffers(current, self.video_buffers))
             self.on_log(f"Видеобуфер RTP: 2048 пакетов, потеря ждёт "
@@ -389,7 +394,14 @@ class Receiver:
                                 f"кадр до {transport.get('largestFrameKiB',0):.0f} КиБ; "
                                 f"восстановлений буфера {transport.get('bufferRecoveries',0)}")
                 decode = self.decode_pipeline.stats() if self.decode_pipeline else {}
-                self.on_stats({**decode, **self.sender_stats, **transport, **self.playout.metrics(), "fps": (self.frame_count - previous_frames) / elapsed,
+                hw = self.decoder_factory.status_snapshot() if self.decoder_factory else {}
+                self.on_stats({**decode,
+                               "hwDecodeRequested": str(hw.get("requestedMode", "")),
+                               "hwDecodeMode": str(hw.get("selectedMode", "")),
+                               "hwDecodeVerified": bool(hw.get("verifiedHardware", False)),
+                               "hwDecodeReason": str(hw.get("reason") or "")[:200],
+                               **self.sender_stats, **transport, **self.playout.metrics(),
+                               "fps": (self.frame_count - previous_frames) / elapsed,
                                "bitrate": max(0, received - previous_bytes) * 8 / elapsed / 1e6,
                                "jitter": jitter,
                                "convertedFps": (self.converted_count - previous_converted) / elapsed,
@@ -417,7 +429,9 @@ class Receiver:
             await old.close()
         for pipeline in self.decode_pipelines:
             pipeline.close()
-        self.decode_pipelines, self.decode_pipeline = [], None
+        if self.decoder_factory is not None:
+            self.decoder_factory.close()
+        self.decoder_factory, self.decode_pipelines, self.decode_pipeline = None, [], None
         self.sender_stats = {}
         self.video_buffers = []
         self.converted_count = self.dropped_count = 0
