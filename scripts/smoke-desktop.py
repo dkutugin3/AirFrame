@@ -35,7 +35,11 @@ async def synthetic_sender():
                 await socket.receive_json()
                 await peer.setLocalDescription(await peer.createOffer())
                 await socket.send_json({'type':'offer','session':'gui-test','sdp':peer.localDescription.sdp})
-                answer = await socket.receive_json()
+                # Signaling now interleaves volume/audio state, so wait for the answer itself.
+                while True:
+                    answer = await socket.receive_json()
+                    if answer.get('type') == 'answer':
+                        break
                 await peer.setRemoteDescription(RTCSessionDescription(type='answer',sdp=answer['sdp']))
                 await asyncio.sleep(8)
     except Exception as exc:

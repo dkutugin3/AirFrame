@@ -12,8 +12,8 @@ import qrcode
 import shiboken6
 
 from aiohttp import web
-from PySide6.QtCore import QObject, QRect, Qt, QTimer, Signal, Slot
-from PySide6.QtGui import QAction, QColor, QFont, QImage, QPainter
+from PySide6.QtCore import QEvent, QObject, QRect, QSize, Qt, QTimer, Signal, Slot
+from PySide6.QtGui import QAction, QColor, QFont, QImage, QKeySequence, QPainter, QShortcut
 from PySide6.QtMultimedia import QAudioFormat, QAudioSink
 from PySide6.QtNetwork import QAbstractSocket, QNetworkInterface
 from PySide6.QtWidgets import (
@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QWidget,
 )
 
+from . import render as video_render
 from .receiver import Receiver
 from .server import (BASE_PROFILE, Room, TelemetrySampler, create_app,
                      format_telemetry_lines, telemetry_bottleneck, video_settings)
@@ -86,33 +87,94 @@ class FrameNotice(QObject):
 
 
 class Frames:
-    """One-slot mailbox: slow UI painting never queues old frames."""
+    """Latest-ready-frame mailbox: the decode thread prepares each visible output.
+
+    ``put`` is called from the decoded-frame worker thread (see Receiver). It
+    stores the YUV frame and prepares it for every *active* renderer, so the
+    per-frame YUV bridge copy happens off the GUI thread. The GUI is notified
+    once per batch and presents only the newest prepared frame per window, so
+    notifications never accumulate and a hidden window costs nothing.
+    """
     def __init__(self):
         self.lock = threading.Lock()
-        self.image = None
         self.serial = 0
+        self.frame = None
+        self.renderers = {}
+        self.ready = {}
+        self.preview_stride = 1
         self.notification_pending = False
         self.notice = FrameNotice(self)
+        self._legacy_serial = 0
+        self._legacy_image = None
+
+    def attach_renderer(self, key, renderer):
+        with self.lock:
+            self.renderers[key] = renderer
+
+    def detach_renderer(self, key):
+        with self.lock:
+            self.renderers.pop(key, None)
+
+    def set_preview_stride(self, stride):
+        """Skip preview frames on the decode thread while the OBS window is open."""
+        with self.lock:
+            self.preview_stride = max(1, int(stride))
 
     def put(self, frame):
-        image = None
-        if frame is not None:
-            converted = frame.reformat(format="bgra")
-            plane = converted.planes[0]
-            image = QImage(memoryview(plane), converted.width, converted.height, plane.line_size,
-                           QImage.Format.Format_ARGB32)
-            image._frame_owner = converted  # Pin the PyAV buffer for both Qt windows.
         with self.lock:
-            self.image = image
             self.serial += 1
+            serial = self.serial
+            self.frame = frame
+            renderers = list(self.renderers.items())
+            stride = self.preview_stride
             notify = not self.notification_pending
             self.notification_pending = True
+        ready = {}
+        if frame is not None:
+            for key, renderer in renderers:
+                try:
+                    if not renderer.wants_frame():
+                        continue
+                    if key == "preview" and stride > 1 and serial % stride:
+                        continue
+                    ready[key] = renderer.prepare(frame, serial=serial)
+                except Exception:
+                    # One broken output must not stop the other one or the mailbox.
+                    continue
+        with self.lock:
+            self.ready = ready
         if notify:
             self.notice.wake.emit()
+        return serial
+
+    def take_ready(self):
+        with self.lock:
+            ready, self.ready = self.ready, {}
+            return ready
+
+    def latest(self):
+        with self.lock:
+            if self.serial == 0:
+                return None
+            return self.serial, self.frame
 
     def get(self):
+        """Legacy helper for the native smoke scripts: ``(serial, QImage)``.
+
+        The main path never calls this; it is the old conversion kept only so
+        scripts/smoke-*.py keep checking the session end state.
+        """
         with self.lock:
-            return self.serial, self.image
+            serial, frame = self.serial, self.frame
+        if serial != self._legacy_serial:
+            self._legacy_serial = serial
+            self._legacy_image = None if frame is None else video_render.software_image_from_av(frame)
+        return serial, None if frame is None else self._legacy_image
+
+    def clear(self):
+        with self.lock:
+            self.frame = None
+            self.ready = {}
 
 
 class AudioOut(QObject):
@@ -246,72 +308,77 @@ class LocalServer:
             self.thread.join(timeout=5)
 
 
-class VideoSurface(QWidget):
-    def __init__(self, frames, preview=False):
-        super().__init__()
-        self.frames, self.preview = frames, preview
-        self.seen = -1
-        self.painted_serial = -1
-        self.painted_frames = 0
-        self.last_metric_at = time.monotonic()
-        self.previous_painted = 0
-        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
-        self.setMinimumSize(320, 180)
-        self.timer = QTimer(self)
-        self.timer.setTimerType(Qt.TimerType.PreciseTimer)
-        self.timer.setSingleShot(True)
-        self.timer.setInterval(0)
-        self.timer.timeout.connect(self.refresh)
-        self.frames.notice.changed.connect(self.frame_ready)
+class VideoPane(QWidget):
+    """One video output surface: the renderer widget plus the idle preview placeholder."""
 
-    def frame_ready(self):
-        # Frame arrival schedules one GUI update, without a second 16 ms clock.
-        # Qt coalesces paints; FrameNotice coalesces cross-thread notifications.
-        if not self.isVisible():
-            return
-        if self.timer.interval() == 0:
-            self.refresh()
-        elif not self.timer.isActive():
-            self.timer.start()
+    def __init__(self, renderer_factory, preview=False, parent=None):
+        super().__init__(parent)
+        self.preview = preview
+        self.renderer = renderer_factory()
+        self._last_metric_at = time.monotonic()
+        self._previous_presented = 0
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.renderer.widget())
+        self.placeholder = QLabel(
+            "Здесь будет ваш Android\n\nВведите адрес и код на телефоне\nБез USB · Без отладки · Без root",
+            self,
+        )
+        self.placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.placeholder.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.placeholder.setStyleSheet("QLabel {background:#151d19;color:#b6f5a1;font-size:16px;}")
+        self.placeholder.setVisible(bool(preview))
+
+    def set_active(self, active):
+        self.renderer.set_active(active)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.placeholder.setGeometry(self.rect())
 
     def showEvent(self, event):
         super().showEvent(event)
-        self.refresh()
+        self.renderer.set_active(True)
+        self.placeholder.setGeometry(self.rect())
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self.renderer.set_active(False)
+
+    def present(self, prepared):
+        if self.renderer.present(prepared):
+            if self.preview:
+                self.placeholder.hide()
+
+    def refresh_latest(self, frames):
+        """Show the newest mailbox frame after becoming visible (one conversion)."""
+        latest = frames.latest()
+        if latest is None or latest[1] is None:
+            return
+        serial, frame = latest
+        if self.renderer.presented_serial == serial:
+            return
+        self.present(self.renderer.prepare(frame, serial=serial))
+
+    def clear(self):
+        self.renderer.clear()
+        if self.preview:
+            self.placeholder.show()
+            self.placeholder.setGeometry(self.rect())
+
+    def current_image(self):
+        return self.renderer.last_image()
+
+    @property
+    def painted_frames(self):
+        return self.renderer.stats()["framesPresented"]
 
     def presentation_fps(self):
         now = time.monotonic()
-        fps = (self.painted_frames - self.previous_painted) / max(.001, now - self.last_metric_at)
-        self.previous_painted, self.last_metric_at = self.painted_frames, now
+        presented = self.painted_frames
+        fps = (presented - self._previous_presented) / max(.001, now - self._last_metric_at)
+        self._previous_presented, self._last_metric_at = presented, now
         return fps
-
-    def refresh(self):
-        serial, _ = self.frames.get()
-        if serial != self.seen:
-            self.seen = serial
-            self.update()
-
-    def paintEvent(self, event):
-        painter = QPainter(self)
-        painter.fillRect(self.rect(), QColor("#000000"))
-        serial, image = self.frames.get()
-        if image is not None:
-            if serial != self.painted_serial:
-                self.painted_serial = serial
-                self.painted_frames += 1
-            size = image.size().scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio)
-            target = QRect((self.width()-size.width())//2, (self.height()-size.height())//2, size.width(), size.height())
-            painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-            painter.drawImage(target, image)
-        elif self.preview:
-            painter.fillRect(self.rect(), QColor("#151d19"))
-            painter.setPen(QColor("#b6f5a1"))
-            painter.setFont(QFont("Arial", 21))
-            painter.drawText(self.rect().adjusted(20,-35,-20,-35), Qt.AlignmentFlag.AlignCenter, "Здесь будет ваш Android")
-            painter.setPen(QColor("#929d95"))
-            painter.setFont(QFont("Arial", 12))
-            painter.drawText(self.rect().adjusted(20,40,-20,40), Qt.AlignmentFlag.AlignCenter,
-                             "Введите адрес и код на телефоне\nБез USB · Без отладки · Без root")
-        painter.end()
 
 
 def text(value, kind="", wrap=False):
@@ -331,9 +398,10 @@ def panel():
 
 
 class Desktop(QMainWindow):
-    def __init__(self, server):
+    def __init__(self, server, renderer_factory=None):
         super().__init__()
         self.server = server
+        self.renderer_factory = renderer_factory or (lambda: video_render.create_renderer("auto"))
         self.setWindowTitle("AirFrame")
         self.resize(1200,900)
         self.setMinimumSize(950,780)
@@ -352,7 +420,7 @@ class Desktop(QMainWindow):
         body.setSpacing(24)
         left = QVBoxLayout()
         left.addWidget(text("ANDROID → КОМПЬЮТЕР    /    ПРЕДПРОСМОТР", "eyebrow"))
-        self.surface = VideoSurface(server.frames, preview=True)
+        self.surface = VideoPane(self.renderer_factory, preview=True)
         left.addWidget(self.surface,1)
         self.detail = text("Готов к подключению по Wi-Fi", "muted", True)
         left.addWidget(self.detail)
@@ -453,6 +521,12 @@ class Desktop(QMainWindow):
         ql.addWidget(self.playout_mode)
         ql.addWidget(text("Стабильность сглаживает поступление кадров пачками ценой дополнительной задержки. "
                           "Паузы длиннее запаса или пропущенные телефоном кадры могут остаться заметны.","muted",True))
+        self.exact_output = QCheckBox("Точный размер окна OBS: 1:1 по физическим пикселям")
+        self.exact_output.setChecked(True)
+        self.exact_output.toggled.connect(self.exact_output_toggled)
+        ql.addWidget(self.exact_output)
+        ql.addWidget(text("Окно «AirFrame — OBS» подгоняется так, чтобы его физические пиксели совпадали "
+                          "с кадром телефона: OBS не увеличивает уменьшенную картинку.","muted",True))
         ql.addWidget(text("Громкость телефона","eyebrow"))
         volume_row = QHBoxLayout()
         self.phone_volume = QSlider(Qt.Orientation.Horizontal)
@@ -506,8 +580,14 @@ class Desktop(QMainWindow):
         self.setCentralWidget(root)
         self.obs = QMainWindow()
         self.obs.setWindowTitle("AirFrame — OBS")
-        self.obs.resize(1280,720)
-        self.obs.setCentralWidget(VideoSurface(server.frames))
+        # Frameless: a "window capture" source in OBS gets only the video, not a title bar.
+        self.obs.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
+        self.obs.resize(1280, 720)
+        self.obs_pane = VideoPane(self.renderer_factory)
+        self.obs.setCentralWidget(self.obs_pane)
+        self.obs.installEventFilter(self)
+        self._exact_size = None
+        QShortcut(QKeySequence("Escape"), self.obs, activated=self.obs.hide)
         self.journal = QPlainTextEdit()
         self.journal.setReadOnly(True)
         self.journal.setMaximumBlockCount(1000)
@@ -516,6 +596,8 @@ class Desktop(QMainWindow):
         self.diagnostics.resize(780,480)
         diag_widget = QWidget()
         dl = QVBoxLayout(diag_widget)
+        self.output_diag = text("", "muted", True)
+        dl.addWidget(self.output_diag)
         dl.addWidget(text("Оба устройства должны быть в одной сети. Разрешите локальную сеть в брандмауэре. "
                           "Для OBS: источник «Захват окна» → «AirFrame — OBS». Окно вывода оставьте открытым. "
                           "На macOS дайте OBS разрешение на запись экрана.\n"
@@ -525,6 +607,9 @@ class Desktop(QMainWindow):
         export.clicked.connect(self.export_log)
         dl.addWidget(export)
         self.diagnostics.setCentralWidget(diag_widget)
+        server.frames.attach_renderer("preview", self.surface.renderer)
+        server.frames.attach_renderer("obs", self.obs_pane.renderer)
+        server.frames.notice.changed.connect(self.frames_ready)
         self.sync_profile_controls()
         self.profile.currentTextChanged.connect(self.select_profile)
         self.rate.valueChanged.connect(self.custom_profile)
@@ -734,13 +819,13 @@ class Desktop(QMainWindow):
         self.fps.setText(f"{stats['fps']:.0f}" if stats else "—")
         self.bitrate.setText(f"{stats['bitrate']:.1f}" if stats else "—")
         self.jitter.setText(f"{stats['jitter']:.1f}" if stats else "—")
-        _, image = self.server.frames.get()
-        size=f"{image.width()} × {image.height()}" if image is not None else "—"
-        # Keep the clean output at 60 Hz; avoid scaling two large windows at 60 Hz.
-        preview_interval = 33 if self.obs.isVisible() else 0
-        if self.surface.timer.interval() != preview_interval:
-            self.surface.timer.setInterval(preview_interval)
-        surface = self.obs.centralWidget() if self.obs.isVisible() else self.surface
+        latest = self.server.frames.latest()
+        frame = latest[1] if latest is not None else None
+        size = f"{frame.width} × {frame.height}" if frame is not None else "—"
+        # Keep the clean output smooth; while both windows are open the preview
+        # presents every second frame instead of scaling two large windows at 60 Hz.
+        self.server.frames.set_preview_stride(2 if self.obs.isVisible() else 1)
+        surface = self.obs_pane if self.obs.isVisible() else self.surface
         paint_fps = surface.presentation_fps()
         pipeline_detail = (f"\nПодготовка: {stats.get('convertedFps',0):.0f} fps · вывод: {paint_fps:.0f} fps"
                            f" · пропущено устаревших: {stats.get('skipped',0)}"
@@ -786,10 +871,113 @@ class Desktop(QMainWindow):
                 self.phone_volume.setValue(int(volume))
         self.volume_value.setText(f"{int(volume)}%" if volume is not None else "—")
         self.loss.setText(f"Потери: {stats['loss']:.1f}% · {size} · приём включает WebRTC overhead{sender_detail}{telemetry_detail}{pipeline_detail}" if stats else "Потери: — · размер: —")
+        self._refresh_output_diag()
+
+    def eventFilter(self, obj, event):
+        if obj is self.obs:
+            if event.type() == QEvent.Type.Show:
+                self.obs_pane.set_active(True)
+                self.obs_pane.refresh_latest(self.server.frames)
+                self.server.frames.set_preview_stride(2)
+                self.obs_button.setText("↘  Скрыть окно для OBS")
+                self._refresh_output_diag()
+            elif event.type() == QEvent.Type.Hide:
+                self.obs_pane.set_active(False)
+                self.server.frames.set_preview_stride(1)
+                self.obs_button.setText("↗  Открыть чистое окно для OBS")
+                self._refresh_output_diag()
+        return super().eventFilter(obj, event)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.surface.set_active(True)
+        self.surface.refresh_latest(self.server.frames)
+        self._refresh_output_diag()
+
+    def hideEvent(self, event):
+        super().hideEvent(event)
+        self.surface.set_active(False)
+
+    @Slot()
+    def frames_ready(self):
+        """GUI side of the mailbox: present the newest prepared frame per window."""
+        if getattr(self, "closing", False):
+            return
+        ready = self.server.frames.take_ready()
+        for key, prepared in ready.items():
+            pane = self.obs_pane if key == "obs" else self.surface
+            pane.present(prepared)
+        latest = self.server.frames.latest()
+        if latest is None or latest[1] is None:
+            self.surface.clear()
+            self.obs_pane.clear()
+        else:
+            # The exact output size follows the stream, independent of the
+            # preview throttling (the preview may skip this serial entirely).
+            self._apply_output_size()
+        self._refresh_output_diag()
+
+    def exact_output_toggled(self, checked):
+        if not checked and self._exact_size is not None:
+            self.obs.setMinimumSize(320, 180)
+            self.obs.setMaximumSize(16777215, 16777215)
+            self._exact_size = None
+            self._refresh_output_diag()
+        elif checked:
+            self._apply_output_size()
+
+    def _apply_output_size(self, prepared=None):
+        """Exact mode: the OBS window's device pixels equal the stream pixels."""
+        frame = prepared
+        if frame is None:
+            latest = self.server.frames.latest()
+            if latest is None or latest[1] is None:
+                return
+            frame = latest[1]
+        width, height = frame.width, frame.height
+        if not self.exact_output.isChecked():
+            return
+        dpr = self.obs.devicePixelRatioF() or 1.0
+        logical = video_render.exact_window_size(QSize(width, height), dpr)
+        size = (logical.width(), logical.height())
+        if size != self._exact_size:
+            self.obs.setFixedSize(logical)
+            self._exact_size = size
+
+    def _refresh_output_diag(self):
+        """Diagnostics: the actual output path/mode and every fallback reason."""
+        if not hasattr(self, "output_diag"):
+            return
+        lines = ["Вывод предпросмотра: " + self.surface.renderer.output_path(),
+                 "Вывод окна OBS: " + self.obs_pane.renderer.output_path()]
+        latest = self.server.frames.latest()
+        frame = latest[1] if latest is not None else None
+        if frame is not None:
+            dpr = self.obs.devicePixelRatioF() or 1.0
+            physical = video_render.physical_size(self.obs.size(), dpr)
+            scale = physical.width() / frame.width if frame.width else 0.0
+            exact = " · точно 1:1" if abs(scale - 1.0) < 0.01 else ""
+            lines.append(
+                f"Кадр: {frame.width} × {frame.height} px · окно OBS "
+                f"{self.obs.width()}×{self.obs.height()} лог. = "
+                f"{physical.width()}×{physical.height()} физ. px · масштаб {scale:.2f}{exact}"
+            )
+        reasons = []
+        for name, renderer in (("предпросмотр", self.surface.renderer), ("OBS", self.obs_pane.renderer)):
+            if renderer.fallback_reason:
+                reasons.append(f"{name}: {renderer.fallback_reason}")
+        if reasons:
+            lines.append("Fallback: " + " · ".join(reasons))
+        self.output_diag.setText("\n".join(lines))
 
     def open_obs(self):
+        if self.obs.isVisible():
+            self.obs.hide()
+            return
+        self._apply_output_size()
         self.obs.show()
         self.obs.raise_()
+        self.obs.activateWindow()
 
     def show_diagnostics(self):
         self.diagnostics.show()
@@ -810,6 +998,10 @@ class Desktop(QMainWindow):
         self.closing = True
         self.obs.hide()
         self.diagnostics.hide()
+        self.server.frames.detach_renderer("preview")
+        self.server.frames.detach_renderer("obs")
+        self.surface.renderer.close()
+        self.obs_pane.renderer.close()
         if self.server.audio is not None:
             self.server.audio.stop()
         self.server.close()
@@ -819,6 +1011,8 @@ class Desktop(QMainWindow):
 def main():
     parser=argparse.ArgumentParser(description="AirFrame — native Android receiver")
     parser.add_argument("--port",type=int,default=8765)
+    parser.add_argument("--renderer",choices=("auto","gpu","software"),default="auto",
+                        help="video output path; auto proves the RHI path at runtime")
     args=parser.parse_args()
     app=QApplication(sys.argv[:1])
     app.setApplicationName("AirFrame")
@@ -826,12 +1020,13 @@ def main():
     events,frames=Events(),Frames()
     audio=AudioOut()
     server=LocalServer(args.port,events,frames,audio)
+    renderer_mode=args.renderer
     try:
         server.start()
     except RuntimeError as exc:
         QMessageBox.critical(None,"AirFrame",str(exc))
         return
-    window=Desktop(server)
+    window=Desktop(server, renderer_factory=lambda: video_render.create_renderer(renderer_mode))
     window.show()
     app.aboutToQuit.connect(server.close)
     code=app.exec()

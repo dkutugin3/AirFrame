@@ -184,6 +184,8 @@ class TwoWindowTests(unittest.TestCase):
         renderer.present(prepared)
         self.assertEqual(renderer.stats()["framesPresented"], 0)
         self.assertEqual(renderer.stats()["framesSkippedHidden"], 1)
+        # Becoming visible activates the renderer for the decode thread (VideoPane does this).
+        renderer.set_active(True)
         _show(renderer, 32, 18)
         self.assertTrue(renderer.wants_frame())
         renderer.refresh()

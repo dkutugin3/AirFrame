@@ -54,7 +54,10 @@ async def send():
                 await ws.send_json({'role':'sender','credential':server.room.qr_token});await ws.receive_json();await ws.receive_json()
                 await peer.setLocalDescription(await peer.createOffer())
                 await ws.send_json({'type':'offer','session':'motion','sdp':peer.localDescription.sdp})
-                answer=await ws.receive_json()
+                # Signaling interleaves volume/audio state; wait for the answer itself.
+                while True:
+                    answer=await ws.receive_json()
+                    if answer.get('type')=='answer':break
                 await peer.setRemoteDescription(RTCSessionDescription(type='answer',sdp=answer['sdp']))
                 await asyncio.sleep(10)
     except Exception as exc:error.append(repr(exc))

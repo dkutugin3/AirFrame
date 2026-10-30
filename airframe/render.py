@@ -310,7 +310,9 @@ class Renderer:
         self.fallback_reason = None
         self._widget = None
         self._closed = False
+        self._active = False
         self._latest = None
+        self._presented_serial = 0
         self._prepared_frames = 0
         self._presented_frames = 0
         self._skipped_hidden = 0
@@ -321,9 +323,21 @@ class Renderer:
     def widget(self):
         return self._widget
 
+    def set_active(self, active):
+        """Called on the GUI thread when a window is shown/hidden.
+
+        ``prepare`` runs on the decode thread, which may only read the plain
+        boolean: visible-but-inactive and hidden windows do no conversion work.
+        """
+        self._active = bool(active)
+
     def wants_frame(self):
         """False when a hidden/closed window must not spend conversion work."""
-        return not self._closed and self._widget is not None and self._widget.isVisible()
+        return not self._closed and self._active
+
+    @property
+    def presented_serial(self):
+        return self._presented_serial
 
     def prepare(self, frame, *, serial):
         raise NotImplementedError
@@ -341,6 +355,7 @@ class Renderer:
             return False
         self._render(prepared)
         self._presented_frames += 1
+        self._presented_serial = prepared.serial
         return True
 
     def refresh(self):
@@ -349,7 +364,12 @@ class Renderer:
             return False
         self._render(self._latest)
         self._presented_frames += 1
+        self._presented_serial = self._latest.serial
         return True
+
+    def last_image(self):
+        """Latest software image, or None for a pure GPU surface."""
+        return None
 
     def clear(self):
         self._latest = None
@@ -377,6 +397,8 @@ class Renderer:
             "framesDroppedClosed": self._dropped_closed,
             "framesGpuRoute": self._gpu_route,
             "framesSoftwareRoute": self._software_route,
+            "active": self._active,
+            "presentedSerial": self._presented_serial,
             "outputPath": self.output_path(),
             "fallbackReason": self.fallback_reason,
         }
@@ -467,6 +489,16 @@ class QtVideoRenderer(Renderer):
             return f"qt-multimedia-rhi/{backend} (yuv_triplanar shader, 1 YUV copy/frame)"
         return "qt-multimedia-cpu-conversion (no RHI backend active; software colour path if unsupported)"
 
+    def last_image(self):
+        if self._layout.currentWidget() is self._surface:
+            return self._surface.image()
+        return None
+
+    def clear(self):
+        super().clear()
+        self._sink.setVideoFrame(QVideoFrame())
+        self._surface.set_image(None)
+
     def close(self):
         if self._closed:
             return
@@ -507,6 +539,13 @@ class SoftwareVideoRenderer(Renderer):
             prepared.image = image
         self._surface.set_image(image)
         self._software_route += 1
+
+    def last_image(self):
+        return self._surface.image()
+
+    def clear(self):
+        super().clear()
+        self._surface.set_image(None)
 
     def output_path(self):
         return "software (PyAV/swscale YUV->BGRA + QPainter)"
