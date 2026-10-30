@@ -69,7 +69,7 @@ class TelemetrySurfaceTests(unittest.TestCase):
                   **overrides)
 
     def diagnostics(self):
-        return self.window.loss.text() + "\n" + self.window.journal.toPlainText()
+        return self.window.stream_diag.toPlainText() + "\n" + self.window.journal.toPlainText()
 
     def test_telemetry_diagnostics_show_measurement_chain(self):
         self.emit(**TELEMETRY)  # first sample: derived rates are unknown

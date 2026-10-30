@@ -14,7 +14,7 @@ ARTIFACTS=Path(os.environ.get('AIRFRAME_ARTIFACTS_DIR',ROOT/'artifacts/2026-10-3
 if not os.environ.get('AIRFRAME_SMOKE_BUNDLED'):sys.path.insert(0,str(ROOT))
 from aiohttp import ClientSession
 from av import VideoFrame
-from PySide6.QtWidgets import QApplication,QScrollArea
+from PySide6.QtWidgets import QApplication
 from PySide6.QtGui import QColor
 from airframe.desktop import Desktop,Events,Frames,LocalServer
 
@@ -93,7 +93,8 @@ try:
     window.open_obs();app.processEvents()
     assert len(notices)==1, 'Frame notifications accumulated in the GUI queue'
     print('PASS: 21 frame writes coalesce into one GUI notification',flush=True)
-    window.findChildren(QScrollArea)[0].ensureWidgetVisible(window.playout_mode)
+    window.settings_tabs.setCurrentWidget(window.output_scroll)
+    window.output_scroll.ensureWidgetVisible(window.playout_mode)
     app.processEvents()
     window.grab().save(str(ARTIFACTS/'desktop-quality.png'))
     print('PASS: 1920x880 shared-buffer lifetime and native OBS painting',flush=True)

@@ -30,6 +30,9 @@ out=Path('/portable-out');out.mkdir(exist_ok=True)
 wheel=next(Path('/out').glob('airframe-*.whl'))
 version=wheel.stem.split('-')[1]
 manifest={'target':args.target,'application':hashlib.sha256(wheel.read_bytes()).hexdigest(),'wheels':{}}
+with zipfile.ZipFile(wheel) as package:
+    mac_icon=package.read('airframe/assets/airframe.icns')
+    windows_icon=package.read('airframe/assets/airframe.ico')
 
 if args.target.startswith('macos'):
     arch='aarch64' if args.target.endswith('arm64') else 'x86_64'
@@ -42,6 +45,7 @@ if args.target.startswith('macos'):
     if digest.startswith('sha256:') and manifest['runtime']['sha256']!=digest[7:]:raise RuntimeError('Runtime digest mismatch')
     root=work/'AirFrame.app'/'Contents'
     resources=root/'Resources';resources.mkdir(parents=True)
+    (resources/'AirFrame.icns').write_bytes(mac_icon)
     with tarfile.open(archive) as tar:tar.extractall(resources,filter='data')
     runtime=resources/'python'
     site=runtime/'lib'/'python3.14'/'site-packages'
@@ -54,6 +58,7 @@ if args.target.startswith('macos'):
     with (root/'Info.plist').open('wb') as output:
         plistlib.dump({'CFBundleName':'AirFrame','CFBundleDisplayName':'AirFrame','CFBundleIdentifier':'video.airframe.desktop',
                       'CFBundleVersion':'1','CFBundleShortVersionString':version,'CFBundleExecutable':'AirFrame',
+                      'CFBundleIconFile':'AirFrame.icns',
                       'CFBundlePackageType':'APPL','NSHighResolutionCapable':True,'LSMinimumSystemVersion':'14.0',
                       'NSLocalNetworkUsageDescription':'AirFrame принимает экран вашего Android по локальной сети.'},output)
 else:
@@ -72,8 +77,19 @@ else:
     site=runtime/'Lib'/'site-packages'
     (runtime/'python314._pth').write_text('python314.zip\n.\nLib/site-packages\nimport site\n')
     (runtime/'app-entry.py').write_text('from airframe.desktop import main\nmain()\n')
+    verification=runtime/'verification'
+    verification.mkdir()
+    for name in ('verify-windows.ps1','verify-windows-runtime.py'):
+        shutil.copy(Path('/scripts')/name,verification/name)
+    shutil.copy('/scripts/verify-windows.cmd',runtime/'Проверить Windows.cmd')
+    shutil.copy('/scripts/verify-windows-README.md',runtime/'Проверка Windows.md')
+    (work/'AirFrame.ico').write_bytes(windows_icon)
+    (work/'airframe.rc').write_text('1 ICON "AirFrame.ico"\n')
+    subprocess.run(['x86_64-w64-mingw32-windres',str(work/'airframe.rc'),
+                    '-I',str(work),'-O','coff','-o',str(work/'airframe-icon.o')],check=True)
     subprocess.run(['x86_64-w64-mingw32-gcc','-municode','-mwindows','-O2','-s',
-                    '/scripts/windows-launcher.c','-o',str(runtime/'AirFrame.exe')],check=True)
+                    '/scripts/windows-launcher.c',str(work/'airframe-icon.o'),
+                    '-o',str(runtime/'AirFrame.exe')],check=True)
     platform='win_amd64'
 
 downloads=work/'wheels'

@@ -13,13 +13,13 @@ import shiboken6
 
 from aiohttp import web
 from PySide6.QtCore import QEvent, QObject, QRect, QSize, Qt, QTimer, Signal, Slot
-from PySide6.QtGui import QAction, QColor, QFont, QImage, QKeySequence, QPainter, QShortcut
+from PySide6.QtGui import QAction, QColor, QFont, QIcon, QImage, QKeySequence, QPainter, QShortcut
 from PySide6.QtMultimedia import QAudioFormat, QAudioSink
 from PySide6.QtNetwork import QAbstractSocket, QNetworkInterface
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
-    QLayout, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QSlider,
-    QVBoxLayout, QWidget,
+    QLayout, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea,
+    QSizePolicy, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from . import render as video_render
@@ -27,6 +27,7 @@ from .adaptive import AdaptiveQuality
 from .receiver import Receiver
 from .server import (BASE_PROFILE, Room, TelemetrySampler, create_app,
                      format_telemetry_lines, telemetry_bottleneck, video_settings)
+from .widgets import WheelSafeComboBox, WheelSafeSlider
 
 PRESETS = {
     # The experimental 120 fps preset stays selectable but is never a default.
@@ -45,24 +46,52 @@ ACK_REJECTED = "rejected"
 ACK_TIMEOUT = "timeout"
 PLAYOUT_LABELS = {"stable": "стабильность для OBS", "balanced": "баланс", "low": "минимальная задержка"}
 STYLE = """
-QWidget {background:#101216;color:#eef0f3;font-size:12px;}
-QFrame#panel {background:#1a1d22;border:1px solid #30353d;border-radius:12px;}
-QFrame#panel QLabel {background:transparent;}
+QWidget {background:#101416;color:#edf1f2;font-size:13px;}
+QLabel {background:transparent;}
+QFrame#panel {background:#191f23;border:1px solid #2b343a;border-radius:12px;}
 QLabel#brand {font-size:25px;font-weight:650;color:#b6f5a1;}
-QLabel#title {font-size:32px;font-weight:600;}
-QLabel#muted {color:#9299a5;}
-QLabel#eyebrow {color:#b6f5a1;font-size:10px;font-weight:600;}
-QLabel#code {color:#b6f5a1;background:#11171a;font-size:31px;padding:14px;border-radius:8px;}
+QLabel#title {font-size:18px;font-weight:600;}
+QLabel#muted {color:#9aa7af;}
+QLabel#eyebrow {color:#b6f5a1;font-size:12px;font-weight:600;}
+QLabel#status {background:#1e3028;color:#b6f5a1;border-radius:15px;padding:8px 12px;}
+QLabel#qr {background:white;border:4px solid white;border-radius:10px;}
+QLabel#code {color:#b6f5a1;background:#12221c;font-size:28px;font-weight:600;padding:8px;border-radius:8px;}
 QLabel#metric {font-size:26px;font-weight:500;}
-QPushButton {background:#262d35;border:1px solid #3b434d;border-radius:7px;padding:11px 15px;}
-QPushButton:hover {background:#344035;}
-QPushButton#primary {background:#b6f5a1;color:#192a14;font-weight:600;border:0;}
-QPushButton:disabled {color:#66717b;background:#1a1d22;}
-QComboBox,QSpinBox {background:#242931;color:#eef0f3;border:1px solid #39424c;border-radius:6px;padding:9px;min-height:19px;}
-QSlider::groove:horizontal {background:#364139;height:5px;border-radius:2px;}
-QSlider::handle:horizontal {background:#b6f5a1;width:15px;margin:-5px 0;border-radius:7px;}
-QPlainTextEdit {background:#15191e;border:1px solid #30353d;border-radius:7px;color:#aeb7c3;font-family:monospace;font-size:11px;}
-"""
+QPushButton {background:#252f35;border:1px solid #3b484f;border-radius:8px;padding:10px 13px;}
+QPushButton:hover {background:#303e43;border-color:#63746c;}
+QPushButton:pressed {background:#1a262b;}
+QPushButton:focus {border:1px solid #b6f5a1;}
+QPushButton#primary {background:#b6f5a1;color:#192a14;font-weight:600;border:1px solid #b6f5a1;}
+QPushButton#primary:hover {background:#cbffb9;}
+QPushButton:disabled {color:#6c7a81;background:#191f23;border-color:#2b343a;}
+QComboBox {background:#222c32;color:#edf1f2;border:1px solid #3b484f;border-radius:8px;padding:9px 30px 9px 11px;min-height:19px;}
+QComboBox:hover {border-color:#63746c;}
+QComboBox:focus {border-color:#b6f5a1;}
+QComboBox::drop-down {subcontrol-origin:padding;subcontrol-position:top right;width:26px;border:0;}
+QComboBox::down-arrow {image:url("__ASSETS__/chevron.svg");width:12px;height:12px;}
+QComboBox QAbstractItemView {background:#222c32;color:#edf1f2;selection-background-color:#365043;selection-color:#edf1f2;border:1px solid #3b484f;padding:4px;outline:0;}
+QSlider {background:transparent;min-height:24px;}
+QSlider::groove:horizontal {background:#35443d;height:5px;border-radius:2px;}
+QSlider::sub-page:horizontal {background:#85c99a;border-radius:2px;}
+QSlider::handle:horizontal {background:#b6f5a1;width:16px;margin:-6px 0;border-radius:8px;}
+QSlider::handle:horizontal:disabled {background:#64746b;}
+QCheckBox {background:transparent;spacing:9px;min-height:24px;}
+QCheckBox::indicator {width:16px;height:16px;border:1px solid #65756e;border-radius:4px;background:#151d20;}
+QCheckBox::indicator:hover {border-color:#b6f5a1;}
+QCheckBox::indicator:checked {background:#b6f5a1;border-color:#b6f5a1;image:url("__ASSETS__/check.svg");}
+QTabWidget::pane {background:#191f23;border:1px solid #2b343a;border-radius:10px;top:-1px;}
+QTabBar::tab {background:transparent;color:#9aa7af;border-bottom:2px solid transparent;padding:12px 10px;}
+QTabBar::tab:selected {color:#b6f5a1;border-bottom-color:#b6f5a1;}
+QTabBar::tab:hover {color:#edf1f2;}
+QWidget#settingsPage, QScrollArea#settingsScroll {background:#191f23;border:0;}
+QScrollBar:vertical {background:transparent;width:8px;margin:5px 0;}
+QScrollBar::handle:vertical {background:#46554f;border-radius:4px;min-height:36px;}
+QScrollBar::handle:vertical:hover {background:#658070;}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {height:0;}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {background:transparent;}
+QPlainTextEdit {background:#151b1f;border:1px solid #303b42;border-radius:8px;color:#aebbc3;font-family:monospace;font-size:12px;}
+""".replace("__ASSETS__", Path(__file__).with_name("assets").as_posix())
+APP_ICON = Path(__file__).with_name("assets") / "airframe.png"
 
 
 class Events(QObject):
@@ -333,12 +362,13 @@ class VideoPane(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.renderer.widget())
         self.placeholder = QLabel(
-            "Здесь будет ваш Android\n\nВведите адрес и код на телефоне\nБез USB · Без отладки · Без root",
+            "Экран телефона появится здесь\n\nПодключите Android во вкладке «Подключение»",
             self,
         )
         self.placeholder.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.placeholder.setWordWrap(True)
         self.placeholder.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        self.placeholder.setStyleSheet("QLabel {background:#151d19;color:#b6f5a1;font-size:16px;}")
+        self.placeholder.setStyleSheet("QLabel {background:#131b1a;color:#a8bdb0;font-size:16px;padding:24px;}")
         self.placeholder.setVisible(bool(preview))
         # The OBS output pane keeps preparing and holding the newest frame even
         # while its window is closed: opening the window must show it at once,
@@ -403,6 +433,9 @@ def text(value, kind="", wrap=False):
     item = QLabel(value)
     item.setObjectName(kind)
     item.setWordWrap(wrap)
+    if wrap:
+        item.setMinimumWidth(0)
+        item.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
     return item
 
 
@@ -410,9 +443,26 @@ def panel():
     widget = QFrame()
     widget.setObjectName("panel")
     layout = QVBoxLayout(widget)
-    layout.setContentsMargins(20,20,20,20)
+    layout.setContentsMargins(18,18,18,18)
     layout.setSpacing(12)
     return widget, layout
+
+
+def settings_page():
+    """A width-constrained settings page with vertical scrolling only."""
+    area = QScrollArea()
+    area.setObjectName("settingsScroll")
+    area.setWidgetResizable(True)
+    area.setFrameShape(QFrame.Shape.NoFrame)
+    area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    page = QWidget()
+    page.setObjectName("settingsPage")
+    layout = QVBoxLayout(page)
+    layout.setContentsMargins(18,18,18,18)
+    layout.setSpacing(12)
+    layout.setSizeConstraint(QLayout.SizeConstraint.SetMinAndMaxSize)
+    area.setWidget(page)
+    return area, layout
 
 
 class Desktop(QMainWindow):
@@ -421,24 +471,32 @@ class Desktop(QMainWindow):
         self.server = server
         self.renderer_factory = renderer_factory or (lambda: video_render.create_renderer("auto"))
         self.setWindowTitle("AirFrame")
-        self.resize(1200,900)
-        self.setMinimumSize(950,780)
+        self.setWindowIcon(QIcon(str(APP_ICON)))
+        self.resize(1220,820)
+        self.setMinimumSize(880,640)
         self.setStyleSheet(STYLE)
         root = QWidget()
         layout = QVBoxLayout(root)
-        layout.setContentsMargins(30,26,30,24)
+        layout.setContentsMargins(24,20,24,18)
         layout.setSpacing(18)
         header = QHBoxLayout()
         header.addWidget(text("◉  airframe", "brand"))
         header.addStretch()
-        self.status = text("●  Ожидание телефона", "eyebrow")
+        self.status = text("●  Ожидание телефона", "status")
         header.addWidget(self.status)
         layout.addLayout(header)
+
         body = QHBoxLayout()
-        body.setSpacing(24)
+        body.setSpacing(20)
         left = QVBoxLayout()
-        left.addWidget(text("ANDROID → КОМПЬЮТЕР    /    ПРЕДПРОСМОТР", "eyebrow"))
+        left.setSpacing(12)
+        preview_header = QHBoxLayout()
+        preview_header.addWidget(text("Предпросмотр", "title"))
+        preview_header.addStretch()
+        preview_header.addWidget(text("ANDROID → КОМПЬЮТЕР", "muted"))
+        left.addLayout(preview_header)
         self.surface = VideoPane(self.renderer_factory, preview=True)
+        self.surface.setMinimumSize(240,180)
         left.addWidget(self.surface,1)
         self.detail = text("Готов к подключению по Wi-Fi", "muted", True)
         left.addWidget(self.detail)
@@ -447,69 +505,97 @@ class Desktop(QMainWindow):
         self.fps = text("—", "metric")
         self.bitrate = text("—", "metric")
         self.jitter = text("—", "metric")
-        for title, value in (("FPS ДЕКОДИРОВАНИЯ",self.fps),("ПРИЁМ, МБИТ/С",self.bitrate),("ДЖИТТЕР, МС",self.jitter)):
+        for title, value in (("FPS",self.fps),("Мбит/с",self.bitrate),("Джиттер, мс",self.jitter)):
             column = QVBoxLayout()
-            column.addWidget(text(title,"muted"))
+            column.setSpacing(4)
             column.addWidget(value)
+            column.addWidget(text(title,"muted"))
             row.addLayout(column,1)
         metrics_layout.addLayout(row)
         self.loss = text("Потери: — · размер: —", "muted", True)
         metrics_layout.addWidget(self.loss)
         left.addWidget(metrics)
-        self.obs_button = QPushButton("↗  Открыть чистое окно для OBS")
+        self.obs_button = QPushButton("Открыть окно для OBS  ↗")
+        self.obs_button.setObjectName("primary")
         self.obs_button.clicked.connect(self.open_obs)
         left.addWidget(self.obs_button)
-        left.addWidget(text("Для 60 fps: Wi-Fi 5/6 на 5 или 6 ГГц; компьютер желательно подключить по Ethernet. "
-                            "Для 120 fps дополнительно нужен телефон с экраном 120 Гц. "
-                            "Фактические fps зависят от телефона, сети и компьютера.","muted",True))
+        self.stop = QPushButton("Завершить трансляцию")
+        self.stop.setEnabled(False)
+        self.stop.clicked.connect(server.stop_stream)
+        left.addWidget(self.stop)
+        left.addWidget(text("Для плавной передачи: Wi-Fi 5/6 на 5 или 6 ГГц. "
+                            "Компьютер лучше подключить по Ethernet.","muted",True))
         body.addLayout(left,1)
-        right = QVBoxLayout()
-        connection, cl = panel()
-        connection.setMinimumHeight(590)
-        cl.addWidget(text("01   ПОДКЛЮЧИТЕ ТЕЛЕФОН","eyebrow"))
-        cl.addWidget(text("Адрес компьютера","muted"))
-        self.addresses = QComboBox()
-        self.refresh_addresses()
-        cl.addWidget(self.addresses)
+
+        self.settings_tabs = QTabWidget()
+        self.settings_tabs.setMinimumWidth(360)
+        self.settings_tabs.setMaximumWidth(400)
+        self.settings_tabs.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
+        self.settings_tabs.setDocumentMode(True)
+        self.settings_tabs.tabBar().setDrawBase(False)
+        self.connection_scroll, cl = settings_page()
+        self.settings_scroll = self.connection_scroll
+        self.video_scroll, ql = settings_page()
+        self.output_scroll, ol = settings_page()
+        self.settings_tabs.addTab(self.connection_scroll, "Подключение")
+        self.settings_tabs.addTab(self.video_scroll, "Видео")
+        self.settings_tabs.addTab(self.output_scroll, "Звук и OBS")
+
+        cl.addWidget(text("Сканируйте QR в AirFrame на Android, затем разрешите захват экрана.","muted",True))
         self.qr = QLabel()
+        self.qr.setObjectName("qr")
+        self.qr.setFixedSize(232,232)
         self.qr.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        cl.addWidget(self.qr)
+        cl.addWidget(self.qr,0,Qt.AlignmentFlag.AlignHCenter)
         self.qr_payload = None
-        self.addresses.currentTextChanged.connect(lambda _: self.refresh_code())
-        cl.addWidget(text("Резервный код подключения","muted"))
+        cl.addWidget(text("Код для ручного подключения","muted"))
         self.code = text("", "code")
-        self.code.setMinimumHeight(76)
         self.code.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.code.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         cl.addWidget(self.code)
-        self.expires = text("Код действует 10 минут","muted")
-        cl.addWidget(self.expires)
+        code_actions = QHBoxLayout()
+        self.expires = text("Код действует 10 минут","muted",True)
+        code_actions.addWidget(self.expires,1)
         rotate = QPushButton("Обновить код")
         rotate.clicked.connect(server.rotate)
-        cl.addWidget(rotate)
-        cl.addWidget(text("На Android нажмите «Сканировать QR». После сканирования разрешите захват экрана.","muted",True))
-        right.addWidget(connection)
-        quality, ql = panel()
-        quality.setMinimumHeight(430)
-        ql.addWidget(text("02   НАСТРОЙТЕ КАЧЕСТВО","eyebrow"))
-        self.profile = QComboBox()
+        code_actions.addWidget(rotate)
+        cl.addLayout(code_actions)
+        cl.addSpacing(4)
+        cl.addWidget(text("Адрес компьютера","muted"))
+        self.addresses = WheelSafeComboBox()
+        self.refresh_addresses()
+        cl.addWidget(self.addresses)
+        self.addresses.currentTextChanged.connect(lambda _: self.refresh_code())
+        cl.addWidget(text("Телефон и компьютер должны быть в одной локальной сети.","muted",True))
+        cl.addStretch()
+
+        ql.addWidget(text("Качество трансляции", "title"))
+        ql.addWidget(text("Профиль","muted"))
+        self.profile = WheelSafeComboBox()
         self.profile.addItems([*PRESETS,"Свой профиль"])
         ql.addWidget(self.profile)
         row = QHBoxLayout()
-        self.target_fps = QComboBox()
+        fps_column = QVBoxLayout()
+        fps_column.setSpacing(6)
+        fps_column.addWidget(text("Частота кадров","muted"))
+        self.target_fps = WheelSafeComboBox()
         for rate in (30,60,120):
             self.target_fps.addItem(f"{rate} fps",rate)
-        self.max_size = QComboBox()
+        fps_column.addWidget(self.target_fps)
+        size_column = QVBoxLayout()
+        size_column.setSpacing(6)
+        size_column.addWidget(text("Разрешение","muted"))
+        self.max_size = WheelSafeComboBox()
         for size in (1280,1920,2560):
             self.max_size.addItem(f"{size} px",size)
-        self.max_size.setCurrentIndex(1)
-        row.addWidget(self.target_fps)
-        row.addWidget(self.max_size)
+        size_column.addWidget(self.max_size)
+        row.addLayout(fps_column,1)
+        row.addLayout(size_column,1)
         ql.addLayout(row)
-        ql.addWidget(text("Максимальная длинная сторона кадра","muted"))
-        self.rate_label = text("Битрейт: максимум 10 Мбит/с","muted")
+        ql.addWidget(text("Разрешение ограничивает длинную сторону кадра. Пропорции сохраняются.","muted",True))
+        self.rate_label = text("Битрейт: максимум 24 Мбит/с","muted",True)
         ql.addWidget(self.rate_label)
-        self.rate = QSlider(Qt.Orientation.Horizontal)
+        self.rate = WheelSafeSlider(Qt.Orientation.Horizontal)
         self.rate.setRange(4,80)
         ql.addWidget(self.rate)
         self.apply_button = apply = QPushButton("Применить профиль")
@@ -528,78 +614,70 @@ class Desktop(QMainWindow):
         self.profile_timeout.setSingleShot(True)
         self.profile_timeout.timeout.connect(self.profile_timed_out)
         ql.addWidget(self.profile_result)
-        self.smoothness = QCheckBox("Плавность: снижать 2560→1920 px при устойчивом "
-                                    "ограничении кодировщика")
+        ql.addSpacing(6)
+        self.smoothness = QCheckBox("Приоритет плавности")
         self.smoothness.setChecked(False)
         self.smoothness.toggled.connect(self.smoothness_toggled)
         ql.addWidget(self.smoothness)
+        ql.addWidget(text("Если кодировщик не справляется, снижать 2560 → 1920 px.","muted",True))
         self.adaptive = AdaptiveQuality(base=video_settings(dict(self.server.room.saved_profile)),
                                         floor=1920, priority="quality")
         self.adaptive_now = time.monotonic
-        ql.addWidget(text("Плавность вывода", "eyebrow"))
-        self.playout_mode = QComboBox()
-        self.playout_mode.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-        self.playout_mode.setMinimumContentsLength(12)
+        ql.addWidget(text("120 fps — экспериментальный режим. Фактическая частота зависит от телефона, сети и компьютера.","muted",True))
+        ql.addStretch()
+
+        ol.addWidget(text("Вывод в OBS", "title"))
+        ol.addWidget(text("Плавность вывода","muted"))
+        self.playout_mode = WheelSafeComboBox()
         self.playout_mode.addItem("Стабильность OBS · 250–350 мс", "stable")
         self.playout_mode.addItem("Баланс · 120–200 мс", "balanced")
         self.playout_mode.addItem("Минимальная задержка · без запаса", "low")
         self.playout_mode.currentIndexChanged.connect(self.playout_selected)
-        ql.addWidget(self.playout_mode)
-        ql.addWidget(text("Стабильность сглаживает поступление кадров пачками ценой дополнительной задержки. "
-                          "Паузы длиннее запаса или пропущенные телефоном кадры могут остаться заметны.","muted",True))
-        self.exact_output = QCheckBox("Точный размер окна OBS: 1:1 по физическим пикселям")
+        ol.addWidget(self.playout_mode)
+        ol.addWidget(text("Запас кадров сглаживает сетевые паузы и добавляет задержку.","muted",True))
+        self.exact_output = QCheckBox("Точный размер окна OBS")
         self.exact_output.setChecked(True)
         self.exact_output.toggled.connect(self.exact_output_toggled)
-        ql.addWidget(self.exact_output)
-        ql.addWidget(text("Окно «AirFrame — OBS» подгоняется так, чтобы его физические пиксели совпадали "
-                          "с кадром телефона: OBS не увеличивает уменьшенную картинку.","muted",True))
-        ql.addWidget(text("Громкость телефона","eyebrow"))
+        ol.addWidget(self.exact_output)
+        ol.addWidget(text("Один пиксель кадра соответствует одному физическому пикселю окна.","muted",True))
+        ol.addSpacing(8)
+        ol.addWidget(text("Звук телефона", "title"))
+        self.audio_capture = QCheckBox("Передавать звук телефона")
+        self.audio_capture.setChecked(True)
+        self.audio_capture.toggled.connect(self.audio_toggled)
+        ol.addWidget(self.audio_capture)
+        ol.addWidget(text("Android 10+. Звук воспроизводится на компьютере; в OBS добавьте захват звука рабочего стола. "
+                          "Некоторые приложения запрещают передачу звука.","muted",True))
+        ol.addWidget(text("Громкость мультимедиа","muted"))
         volume_row = QHBoxLayout()
-        self.phone_volume = QSlider(Qt.Orientation.Horizontal)
+        self.phone_volume = WheelSafeSlider(Qt.Orientation.Horizontal)
         self.phone_volume.setRange(0,100)
         self.phone_volume.setEnabled(False)
         self.volume_value = text("—","muted")
         self.volume_value.setMinimumWidth(40)
         volume_row.addWidget(self.phone_volume,1)
         volume_row.addWidget(self.volume_value)
-        ql.addLayout(volume_row)
+        ol.addLayout(volume_row)
         self.volume_dragging = False
         self.volume_sent_at = 0.0
         self.phone_volume.sliderPressed.connect(lambda: setattr(self,"volume_dragging",True))
         self.phone_volume.sliderReleased.connect(self.volume_released)
         self.phone_volume.sliderMoved.connect(self.volume_moved)
-        ql.addWidget(text("Мультимедиа-громкость подключённого телефона. Ползунок синхронизируется, "
-                          "если менять звук на самом телефоне.","muted",True))
-        self.audio_capture = QCheckBox("Захватывать звук телефона")
-        self.audio_capture.setChecked(True)
-        self.audio_capture.toggled.connect(self.audio_toggled)
-        ql.addWidget(self.audio_capture)
-        ql.addWidget(text("Звук телефона воспроизводится на этом компьютере и попадает в OBS как звук "
-                          "рабочего стола. Требуется Android 10+ и разрешение захвата. Звук звонков "
-                          "и запретившие захват приложения не передаются.","muted",True))
-        ql.addWidget(text("WebRTC адаптирует передачу к сети; звук и видео идут одним зашифрованным потоком.","muted",True))
-        right.addWidget(quality)
-        self.stop = QPushButton("■  Завершить трансляцию")
-        self.stop.setEnabled(False)
-        self.stop.clicked.connect(server.stop_stream)
-        right.addWidget(self.stop)
-        right.addStretch()
-        right_container = QWidget()
-        right_container.setLayout(right)
-        right.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
-        right_container.setMinimumWidth(325)
-        right_area = QScrollArea()
-        right_area.setWidgetResizable(True)
-        right_area.setFrameShape(QFrame.Shape.NoFrame)
-        right_area.setWidget(right_container)
-        right_area.setMinimumWidth(350)
-        right_area.setMaximumWidth(370)
-        body.addWidget(right_area)
+        ol.addWidget(text("Громкость синхронизируется с телефоном после подключения.","muted",True))
+        ol.addStretch()
+        for combo in self.settings_tabs.findChildren(QComboBox):
+            # A long option must not dictate the page's minimum width.
+            combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+            combo.setMinimumContentsLength(8)
+            combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        for combo in (self.target_fps, self.max_size):
+            combo.setMinimumContentsLength(4)
+        body.addWidget(self.settings_tabs)
         layout.addLayout(body,1)
         footer = QHBoxLayout()
-        footer.addWidget(text("AIRFRAME 0.5.0   ·   НАТИВНЫЙ ПРИЁМНИК","muted"))
+        footer.addWidget(text("AirFrame 0.5.1 · Локальная трансляция","muted"))
         footer.addStretch()
-        diagnostics = QPushButton("Диагностика и инструкция")
+        diagnostics = QPushButton("Диагностика и помощь")
         diagnostics.clicked.connect(self.show_diagnostics)
         footer.addWidget(diagnostics)
         layout.addLayout(footer)
@@ -619,7 +697,7 @@ class Desktop(QMainWindow):
         self.journal.setMaximumBlockCount(1000)
         self.diagnostics = QMainWindow(self)
         self.diagnostics.setWindowTitle("AirFrame — Диагностика")
-        self.diagnostics.resize(780,480)
+        self.diagnostics.resize(860,700)
         diag_widget = QWidget()
         dl = QVBoxLayout(diag_widget)
         self.output_diag = text("", "muted", True)
@@ -628,7 +706,13 @@ class Desktop(QMainWindow):
                           "Для OBS: источник «Захват окна» → «AirFrame — OBS». Окно вывода оставьте открытым. "
                           "На macOS дайте OBS разрешение на запись экрана.\n"
                           "Код действует 10 минут; после блокировки Android нужно заново разрешить захват.","muted",True))
-        dl.addWidget(self.journal)
+        dl.addWidget(text("Текущая статистика", "eyebrow"))
+        self.stream_diag = QPlainTextEdit()
+        self.stream_diag.setReadOnly(True)
+        self.stream_diag.setPlainText("Статистика появится после подключения телефона.")
+        dl.addWidget(self.stream_diag,1)
+        dl.addWidget(text("Журнал событий", "eyebrow"))
+        dl.addWidget(self.journal,1)
         export = QPushButton("Сохранить журнал…")
         export.clicked.connect(self.export_log)
         dl.addWidget(export)
@@ -677,7 +761,9 @@ class Desktop(QMainWindow):
             matrix.add_data(payload)
             matrix.make(fit=True)
             cells = matrix.get_matrix()
-            scale = max(1, 240 // len(cells))
+            # Integer-sized QR modules stay crisp on high-DPI displays too.
+            ratio = self.devicePixelRatioF()
+            scale = max(1, int(224 * ratio) // len(cells))
             image = QImage(len(cells)*scale,len(cells)*scale,QImage.Format.Format_RGB32)
             image.fill(Qt.GlobalColor.white)
             painter = QPainter(image)
@@ -686,7 +772,9 @@ class Desktop(QMainWindow):
                     if dark:painter.fillRect(x*scale,y*scale,scale,scale,Qt.GlobalColor.black)
             painter.end()
             from PySide6.QtGui import QPixmap
-            self.qr.setPixmap(QPixmap.fromImage(image))
+            pixmap = QPixmap.fromImage(image)
+            pixmap.setDevicePixelRatio(ratio)
+            self.qr.setPixmap(pixmap)
         code = self.server.room.code
         self.code.setText(code[:4]+" "+code[4:])
         remaining = self.server.room.code_until-time.monotonic()
@@ -918,7 +1006,11 @@ class Desktop(QMainWindow):
             if volume is not None:
                 self.phone_volume.setValue(int(volume))
         self.volume_value.setText(f"{int(volume)}%" if volume is not None else "—")
-        self.loss.setText(f"Потери: {stats['loss']:.1f}% · {size} · приём включает WebRTC overhead{sender_detail}{telemetry_detail}{pipeline_detail}" if stats else "Потери: — · размер: —")
+        self.loss.setText(f"Потери: {stats['loss']:.1f}% · кадр: {size}" if stats else "Потери: — · размер: —")
+        self.stream_diag.setPlainText(
+            f"Потери: {stats['loss']:.1f}% · {size} · приём включает WebRTC overhead"
+            f"{sender_detail}{telemetry_detail}{pipeline_detail}"
+            if stats else "Статистика появится после подключения телефона.")
         self.adaptive_observe(stats)
         self._refresh_output_diag()
 
@@ -928,12 +1020,12 @@ class Desktop(QMainWindow):
                 self.obs_pane.set_active(True)
                 self.obs_pane.refresh_latest(self.server.frames)
                 self.server.frames.set_preview_stride(2)
-                self.obs_button.setText("↘  Скрыть окно для OBS")
+                self.obs_button.setText("Скрыть окно для OBS  ↙")
                 self._refresh_output_diag()
             elif event.type() == QEvent.Type.Hide:
                 self.obs_pane.set_active(False)
                 self.server.frames.set_preview_stride(1)
-                self.obs_button.setText("↗  Открыть чистое окно для OBS")
+                self.obs_button.setText("Открыть окно для OBS  ↗")
                 self._refresh_output_diag()
         return super().eventFilter(obj, event)
 
@@ -1088,6 +1180,7 @@ def main():
     args=parser.parse_args()
     app=QApplication(sys.argv[:1])
     app.setApplicationName("AirFrame")
+    app.setWindowIcon(QIcon(str(APP_ICON)))
     app.setStyle("Fusion")
     events,frames=Events(),Frames()
     audio=AudioOut()

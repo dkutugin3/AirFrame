@@ -27,7 +27,7 @@ RUN if [ "$DESKTOP_TARGET" = "windows-x64" ]; then \
     apt-get update && apt-get install -y --no-install-recommends gcc-mingw-w64-x86-64 \
     && rm -rf /var/lib/apt/lists/*; fi
 COPY --from=wheel /out/ /out/
-COPY scripts/package-portable.py scripts/windows-launcher.c /scripts/
+COPY scripts/ /scripts/
 COPY README.md /README.md
 RUN --mount=type=cache,target=/root/.cache/pip env -u PIP_NO_CACHE_DIR python /scripts/package-portable.py --target "$DESKTOP_TARGET"
 
