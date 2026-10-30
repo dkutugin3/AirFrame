@@ -9,9 +9,16 @@ from airframe.server import Room, create_app, validate_signal, video_settings
 
 class SettingsTests(unittest.TestCase):
     def test_profiles(self):
-        self.assertEqual(video_settings({}), {"fps": 120, "bitrate": 80, "maxSize": 2560})
+        # Stage 1 behaviour change: the base profile of a new session is
+        # 60 fps / 24 Mbit/s / 2560 px. The previous expectation (120/80/2560)
+        # encoded the audit defect, not desired behaviour. The experimental
+        # 120 fps preset stays a valid explicit choice; it is just not a default.
+        self.assertEqual(video_settings({}), {"fps": 60, "bitrate": 24, "maxSize": 2560})
         self.assertEqual(video_settings({"fps":60,"bitrate":24,"maxSize":2560})["fps"],60)
         self.assertEqual(video_settings({"fps":120,"bitrate":80})["fps"],120)
+        # The lighter 60/16/1920 profile must remain available for weaker machines.
+        self.assertEqual(video_settings({"fps":60,"bitrate":16,"maxSize":1920}),
+                         {"fps":60,"bitrate":16,"maxSize":1920})
         for value in ({"fps":90},{"fps":True},{"bitrate":100},{"maxSize":999},[],None):
             with self.assertRaises(ValueError):video_settings(value)
 
@@ -68,13 +75,35 @@ class SignalingTests(AioHTTPTestCase):
         self.assertEqual(response.status,403)
         self.assertEqual((await self.client.get('/assets/secrets.txt')).status,404)
 
+    async def test_new_session_requests_quality_60_profile(self):
+        # RED (stage 1): a real connection must ask the phone for the base
+        # profile of a new session: 60 fps, at most 24 Mbit/s, 2560 px long side.
+        # 24 Mbit/s is an upper bound, not a promised actual bitrate.
+        base={"fps":60,"bitrate":24,"maxSize":2560}
+        receiver,auth=await self.connect('receiver')
+        self.assertEqual(auth['type'],'authenticated')
+        sender,auth=await self.connect('sender')
+        self.assertEqual(auth['type'],'authenticated')
+        self.assertEqual((await receiver.receive_json(timeout=2))['type'],'peer-ready')
+        ready=await sender.receive_json(timeout=2)
+        self.assertEqual(ready['type'],'peer-ready')
+        self.assertEqual(ready['settings'],base)
+        # The pairing API advertises exactly the profile the phone is asked to open with.
+        session=await (await self.client.get(
+            '/api/session',headers={"Authorization":f"Bearer {self.room.receiver_token}"})).json()
+        self.assertEqual(session['settings'],ready['settings'])
+        await sender.close();await receiver.close()
+
     async def test_offer_answer_ice_and_reconnect(self):
         receiver,auth=await self.connect('receiver')
         self.assertEqual(auth['type'],'authenticated')
         sender,auth=await self.connect('sender')
         resume=auth['resumeToken']
         self.assertEqual((await receiver.receive_json(timeout=2))['type'],'peer-ready')
-        self.assertEqual((await sender.receive_json(timeout=2))['settings']['fps'],120)
+        # Stage 1: a new session opens with the base profile (60 fps), not the
+        # old 120 fps audit defect. The old expectation here encoded the bug.
+        self.assertEqual((await sender.receive_json(timeout=2))['settings'],
+                         {"fps":60,"bitrate":24,"maxSize":2560})
         await sender.send_json({'type':'offer','session':'1','sdp':'offer-sdp'})
         self.assertEqual((await receiver.receive_json(timeout=2))['sdp'],'offer-sdp')
         await receiver.send_json({'type':'answer','session':'1','sdp':'answer-sdp'})
@@ -152,3 +181,87 @@ class QualitySignalingTests(AioHTTPTestCase):
         await sender.send_json(ack)
         self.assertEqual(await receiver.receive_json(timeout=2),ack)
         await sender.close();await receiver.close()
+
+
+class ProfileAckSignalingTests(AioHTTPTestCase):
+    """Stage 1: the session profile must follow what the phone actually acknowledged.
+
+    Requested != effective when the phone rejects: the session must keep the
+    previously effective profile instead of advertising the wish as applied.
+    """
+    get_application = SignalingTests.get_application
+    connect = SignalingTests.connect
+
+    async def pair(self):
+        receiver,_=await self.connect('receiver')
+        sender,_=await self.connect('sender')
+        await receiver.receive_json(timeout=2)  # peer-ready
+        await sender.receive_json(timeout=2)    # peer-ready with settings
+        return receiver,sender
+
+    async def test_rejected_configure_keeps_previous_effective_profile(self):
+        receiver,sender=await self.pair()
+        try:
+            previous=dict(self.room.settings)
+            requested={'fps':30,'bitrate':10,'maxSize':1920}
+            await receiver.send_json({'type':'configure','settings':requested,'requestId':'profile-1'})
+            self.assertEqual((await sender.receive_json(timeout=2))['settings'],requested)
+            # The saved profile may already hold the wish for the next session,
+            # but a rejection must restore what is still effectively running.
+            await sender.send_json({'type':'configured','requestId':'profile-1',
+                                    'applied':False,'settings':requested})
+            ack=await receiver.receive_json(timeout=2)
+            self.assertEqual(ack['requestId'],'profile-1')
+            self.assertFalse(ack['applied'])
+            self.assertEqual(self.room.settings,previous)
+        finally:
+            await sender.close();await receiver.close()
+
+    async def test_applied_configure_adopts_acked_settings(self):
+        receiver,sender=await self.pair()
+        try:
+            requested={'fps':120,'bitrate':80,'maxSize':2560}
+            await receiver.send_json({'type':'configure','settings':requested,'requestId':'profile-2'})
+            await sender.receive_json(timeout=2)
+            acked={'fps':60,'bitrate':16,'maxSize':1920}
+            await sender.send_json({'type':'configured','requestId':'profile-2',
+                                    'applied':True,'settings':acked})
+            ack=await receiver.receive_json(timeout=2)
+            self.assertTrue(ack['applied'])
+            # The phone's acknowledged settings are the effective profile,
+            # not the requested wish (the phone may clamp values).
+            self.assertEqual(self.room.settings,acked)
+        finally:
+            await sender.close();await receiver.close()
+
+    async def test_late_duplicate_ack_cannot_roll_back_profile(self):
+        receiver,sender=await self.pair()
+        try:
+            requested={'fps':120,'bitrate':80,'maxSize':2560}
+            acked={'fps':60,'bitrate':24,'maxSize':2560}
+            await receiver.send_json({'type':'configure','settings':requested,'requestId':'profile-3'})
+            await sender.receive_json(timeout=2)
+            await sender.send_json({'type':'configured','requestId':'profile-3',
+                                    'applied':True,'settings':acked})
+            await receiver.receive_json(timeout=2)
+            self.assertEqual(self.room.settings,acked)
+            # A duplicate/late acknowledgement for the same requestId must not
+            # overwrite the profile that was already accepted.
+            await sender.send_json({'type':'configured','requestId':'profile-3',
+                                    'applied':True,'settings':requested})
+            await receiver.receive_json(timeout=2)
+            self.assertEqual(self.room.settings,acked)
+        finally:
+            await sender.close();await receiver.close()
+
+    async def test_ack_for_unknown_request_does_not_change_profile(self):
+        receiver,sender=await self.pair()
+        try:
+            previous=dict(self.room.settings)
+            sender_ack={'type':'configured','requestId':'never-requested',
+                        'applied':True,'settings':{'fps':120,'bitrate':80,'maxSize':2560}}
+            await sender.send_json(sender_ack)
+            await receiver.receive_json(timeout=2)
+            self.assertEqual(self.room.settings,previous)
+        finally:
+            await sender.close();await receiver.close()
