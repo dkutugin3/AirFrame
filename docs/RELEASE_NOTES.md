@@ -1,17 +1,16 @@
-# RELEASE NOTES — AirFrame stable-60fps branch (runtime frozen at `2b7a5cb`)
+# RELEASE NOTES — AirFrame 0.5.0 (runtime `a981886`)
 
-Status of this branch: **development/release-candidate line**, not a published release.
-`pyproject.toml` version 0.5.0. The **runtime code is frozen** at commit
-`2b7a5cb8f9091a20a12d547f1e375ade0a2c2711`; later commits are documentation and
-acceptance-tooling only (e.g. `1769f73` records the final acceptance status) and do
-not change the app runtime. Everything below describes that frozen runtime line.
+Status: **release v0.5.0**. `pyproject.toml` version 0.5.0; the released runtime is
+commit `a981886` (stage-8 adaptive quality) plus docs-only commits; the finish pass
+`60cbcee` (review fixes I3/C1/I2/I6/I13) is part of the runtime. Published artifacts
+are rebuilt from this revision in `artifacts/2026-10-30-stable60fps/packages-finish/`.
 
-Suites at the freeze (raw logs):
+Suites at the release revision (raw logs):
 
-- Deterministic headless Docker suite: **Ran 168 tests, OK** —
-  `artifacts/2026-10-30-stable60fps/native/stage7-docker-receiver-wired.log`
-- Native Qt suite (offscreen): **Ran 74 tests, OK** —
-  `artifacts/2026-10-30-stable60fps/native/stage7-native-receiver-wired.log`
+- Deterministic headless Docker suite: **Ran 187 tests, OK** —
+  `artifacts/2026-10-30-stable60fps/verify/20261030T131718Z/docker-suite.log`
+- Native Qt suite (offscreen): **Ran 81 tests, OK** —
+  `artifacts/2026-10-30-stable60fps/verify/20261030T131718Z/native-suite.log`
 
 Re-run `sh scripts/verify.sh` for fresh evidence on the checked-out HEAD, and see
 `docs/VERIFICATION.md` for every command with what it proves and does not prove.
