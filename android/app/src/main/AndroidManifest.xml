@@ -6,6 +6,9 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROJECTION" />
+    <!-- The preserved phone-audio path captures playback with AudioRecord; declared so the
+         feature can be enabled after a runtime grant (feature unverified, see wip commit). -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />
     <application android:label="AirFrame" android:theme="@android:style/Theme.Material.NoActionBar"
         android:allowBackup="false" android:fullBackupContent="false"

@@ -1,11 +1,13 @@
 package video.airframe;
 
+import android.Manifest;
 import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
 import android.app.Service;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.content.pm.ServiceInfo;
 import android.media.AudioAttributes;
 import android.media.AudioFormat;
@@ -187,6 +189,9 @@ public class ProjectionService extends Service {
 
     private void startAudio() {
         if(audioRunning || audioChannel==null || audioChannel.state()!=DataChannel.State.OPEN)return;
+        if(Build.VERSION.SDK_INT<29)return; // playback capture needs Android 10+
+        if(getApplicationContext().checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                !=PackageManager.PERMISSION_GRANTED)return; // feature needs a granted runtime permission
         try{
             MediaProjection projection=projectionForAudio();
             if(projection==null)return;
