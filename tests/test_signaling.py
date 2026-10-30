@@ -265,3 +265,176 @@ class ProfileAckSignalingTests(AioHTTPTestCase):
             self.assertEqual(self.room.settings,previous)
         finally:
             await sender.close();await receiver.close()
+
+
+class TelemetryValidationTests(unittest.TestCase):
+    """Stage 5a: additive sender telemetry validation (old messages stay valid)."""
+    BASE = {"type":"telemetry","session":"s1","encodedFps":60,"width":2560,"height":1440,
+            "limitation":"none"}
+    EXTRA = {"captureFps":59.5,"maxCaptureIntervalMs":34.2,"pacerFps":60,
+             "framesEncoded":12000,"framesSent":11950,"videoBitrateKbps":21500,
+             "avgEncodeTimeMs":7.4,"codec":"H264","codecProfile":"42e01f",
+             "encoderImplementation":"c2.android.avc.encoder","hardwareEncoder":"unknown",
+             "thermalStatus":"light","captureWidth":2560,"captureHeight":1440,
+             "telemetryWindowMs":1000,"sampledMonotonicMs":123456}
+
+    def test_old_telemetry_message_remains_valid(self):
+        self.assertTrue(validate_signal("sender",self.BASE))
+
+    def test_optional_telemetry_fields_are_accepted(self):
+        self.assertTrue(validate_signal("sender",{**self.BASE,**self.EXTRA}))
+
+    def test_optional_telemetry_fields_are_individually_optional(self):
+        for key,value in self.EXTRA.items():
+            self.assertTrue(validate_signal("sender",{**self.BASE,key:value}),key)
+
+    def test_telemetry_bounds_reject_out_of_range(self):
+        message={**self.BASE,**self.EXTRA}
+        for key,value in (("captureFps",-1),("captureFps",1000.01),("maxCaptureIntervalMs",60001),
+                          ("pacerFps",1001),("framesEncoded",-1),("framesSent",-1),
+                          ("videoBitrateKbps",1000001),("avgEncodeTimeMs",60001),
+                          ("captureWidth",0),("captureWidth",16385),("captureHeight",0),
+                          ("telemetryWindowMs",60001),("sampledMonotonicMs",-1)):
+            self.assertFalse(validate_signal("sender",{**message,key:value}),f"{key}={value!r}")
+
+    def test_telemetry_wrong_types_and_non_finite_rejected(self):
+        message={**self.BASE,**self.EXTRA}
+        for key,value in (("captureFps","60"),("captureFps",float("nan")),
+                          ("captureFps",float("inf")),("pacerFps",True),
+                          ("maxCaptureIntervalMs",float("nan")),("framesEncoded",1.5),
+                          ("framesSent",True),("videoBitrateKbps",float("-inf")),
+                          ("avgEncodeTimeMs","7"),("telemetryWindowMs",float("inf")),
+                          ("sampledMonotonicMs",1.0),("captureWidth",2560.0),
+                          ("captureHeight",True),("codec",1),("codec","x"*33),
+                          ("codecProfile","x"*129),("encoderImplementation","x"*129),
+                          ("hardwareEncoder","software"),("hardwareEncoder","x"*17),
+                          ("thermalStatus","hot")):
+            self.assertFalse(validate_signal("sender",{**message,key:value}),f"{key}={value!r}")
+
+    def test_telemetry_requires_the_legacy_measurements(self):
+        for key in ("encodedFps","width","height","limitation"):
+            missing={**self.BASE};del missing[key]
+            self.assertFalse(validate_signal("sender",missing),key)
+
+    def test_telemetry_zero_is_a_measured_value(self):
+        message={**self.BASE,"captureFps":0,"maxCaptureIntervalMs":0,"pacerFps":0,
+                 "framesEncoded":0,"framesSent":0,"videoBitrateKbps":0,"avgEncodeTimeMs":0,
+                 "telemetryWindowMs":0,"sampledMonotonicMs":0,"thermalStatus":"unknown",
+                 "hardwareEncoder":"unknown"}
+        self.assertTrue(validate_signal("sender",message))
+
+
+class TelemetryDiagnosticsTests(unittest.TestCase):
+    """Stage 5a: derived rates and honest diagnostics are headless-testable."""
+    BASE = {"type":"telemetry","session":"s1","encodedFps":60,"width":2560,"height":1440,
+            "limitation":"none"}
+
+    def sampler(self):
+        from airframe.server import TelemetrySampler
+        return TelemetrySampler()
+
+    def sample(self, **values):
+        return {**self.BASE, **values}
+
+    def test_first_sample_rates_are_unknown_not_zero(self):
+        sampler=self.sampler()
+        rates=sampler.update(self.sample(framesEncoded=1200,framesSent=1190,
+                                         sampledMonotonicMs=1000,telemetryWindowMs=1000))
+        self.assertIsNone(rates["encodedFps"])
+        self.assertIsNone(rates["sentFps"])
+        self.assertEqual(rates["reason"],"first-sample")
+
+    def test_equal_timestamps_and_counter_reset_are_unknown(self):
+        sampler=self.sampler()
+        sampler.update(self.sample(framesEncoded=1200,framesSent=1190,sampledMonotonicMs=1000))
+        equal=sampler.update(self.sample(framesEncoded=1260,framesSent=1250,sampledMonotonicMs=1000))
+        self.assertIsNone(equal["encodedFps"])
+        self.assertEqual(equal["reason"],"equal-timestamps")
+        reset=sampler.update(self.sample(framesEncoded=5,framesSent=4,sampledMonotonicMs=2000))
+        self.assertIsNone(reset["encodedFps"])
+        self.assertEqual(reset["reason"],"counter-reset")
+
+    def test_counter_deltas_become_honest_rates(self):
+        sampler=self.sampler()
+        sampler.update(self.sample(framesEncoded=1200,framesSent=1190,sampledMonotonicMs=1000,
+                                   telemetryWindowMs=1000))
+        rates=sampler.update(self.sample(framesEncoded=1260,framesSent=1249,sampledMonotonicMs=2000,
+                                         telemetryWindowMs=1000))
+        self.assertAlmostEqual(rates["encodedFps"],60.0)
+        self.assertAlmostEqual(rates["sentFps"],59.0)
+
+    def test_window_average_when_sample_time_absent(self):
+        sampler=self.sampler()
+        sampler.update(self.sample(framesEncoded=1200,framesSent=1200,telemetryWindowMs=1000))
+        rates=sampler.update(self.sample(framesEncoded=1260,framesSent=1259,telemetryWindowMs=1000))
+        self.assertAlmostEqual(rates["encodedFps"],60.0)
+        self.assertAlmostEqual(rates["sentFps"],59.0)
+
+    def test_legacy_message_without_counters_reports_no_counters(self):
+        rates=self.sampler().update(self.BASE)
+        self.assertIsNone(rates["encodedFps"])
+        self.assertEqual(rates["reason"],"no-counters")
+
+    def test_bottleneck_classification(self):
+        from airframe.server import telemetry_bottleneck
+        rates={"encodedFps":60.0,"sentFps":60.0,"encodedDelta":60,"sentDelta":60,
+               "windowMs":1000,"reason":None}
+        healthy=self.sample(captureFps=59,pacerFps=60,framesEncoded=1260,framesSent=1260,
+                            sampledMonotonicMs=2000)
+        self.assertEqual(telemetry_bottleneck(healthy,rates,received_fps=59,target_fps=60),"none")
+        capture=self.sample(captureFps=40,pacerFps=40,framesEncoded=1260,framesSent=1260,
+                            sampledMonotonicMs=2000)
+        self.assertEqual(telemetry_bottleneck(capture,rates,received_fps=40,target_fps=60),"capture")
+        encoder=self.sample(captureFps=59,pacerFps=45,encodedFps=45,framesEncoded=1260,
+                            framesSent=1260,sampledMonotonicMs=2000)
+        self.assertEqual(telemetry_bottleneck(encoder,rates,received_fps=45,target_fps=60),"encoder")
+        transport=self.sample(captureFps=59,pacerFps=60,encodedFps=60,framesEncoded=1260,
+                              framesSent=1260,sampledMonotonicMs=2000)
+        self.assertEqual(telemetry_bottleneck(transport,rates,received_fps=41,target_fps=60),
+                         "transport")
+        self.assertEqual(telemetry_bottleneck(self.sample(),None,received_fps=None,target_fps=60),
+                         "unknown")
+
+    def test_diagnostics_lines_are_honest(self):
+        from airframe.server import TelemetrySampler, format_telemetry_lines
+        message=self.sample(captureFps=59.5,maxCaptureIntervalMs=34.2,pacerFps=60,
+                            framesEncoded=12000,framesSent=11950,videoBitrateKbps=21500,
+                            avgEncodeTimeMs=7.4,codec="H264",codecProfile="42e01f",
+                            encoderImplementation="c2.android.avc.encoder",
+                            hardwareEncoder="unknown",thermalStatus="light",
+                            captureWidth=2560,captureHeight=1440,telemetryWindowMs=1000,
+                            sampledMonotonicMs=123456)
+        sampler=TelemetrySampler()
+        sampler.update(message)
+        rates=sampler.update({**message,"framesEncoded":12060,"framesSent":12010,
+                              "sampledMonotonicMs":124456,"telemetryWindowMs":1000})
+        text="\n".join(format_telemetry_lines(message,rates,received_fps=59,target_fps=60))
+        self.assertIn("захват 59.5",text)
+        self.assertIn("pacer 60",text)
+        self.assertIn("кодировщик",text)
+        self.assertIn("отправлено",text)
+        self.assertIn("21.5 Мбит/с",text)
+        self.assertIn("среднее время кодирования за окно",text)
+        self.assertNotIn("p95",text)
+        self.assertIn("H264",text)
+        self.assertIn("42e01f",text)
+        self.assertIn("2560×1440",text)
+        self.assertIn("Узкое место",text)
+        absent="\n".join(format_telemetry_lines(self.BASE,None,received_fps=None,target_fps=60))
+        self.assertIn("температура: неизвестно",absent)
+        self.assertIn("аппаратный кодировщик: неизвестно",absent)
+        zero="\n".join(format_telemetry_lines(self.sample(captureFps=0,videoBitrateKbps=0),
+                                              None,received_fps=None,target_fps=60))
+        self.assertIn("захват 0",zero)
+        self.assertIn("0 кбит/с",zero)
+
+    def test_first_sample_and_reset_are_reported_in_lines(self):
+        from airframe.server import format_telemetry_lines
+        first="\n".join(format_telemetry_lines(self.BASE,{"reason":"first-sample",
+                                                          "encodedFps":None,"sentFps":None},
+                                               received_fps=None,target_fps=60))
+        self.assertIn("первый замер",first)
+        reset="\n".join(format_telemetry_lines(self.BASE,{"reason":"counter-reset",
+                                                          "encodedFps":None,"sentFps":None},
+                                               received_fps=None,target_fps=60))
+        self.assertIn("Счётчики сброшены",reset)
