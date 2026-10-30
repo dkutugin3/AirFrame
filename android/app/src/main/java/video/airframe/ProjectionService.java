@@ -24,6 +24,7 @@ import android.os.Handler;
 import android.os.IBinder;
 import android.os.Looper;
 import android.os.PowerManager;
+import android.os.SystemClock;
 import android.util.DisplayMetrics;
 import android.view.WindowManager;
 
@@ -74,30 +75,38 @@ public class ProjectionService extends Service {
     private String profileRequest="";
     private final List<IceCandidate> pendingIce=new ArrayList<>();
     private Runnable reconnectTask, restartTask, stableTask;
-    private long lastFrames=0, lastStatsNs=0;
+    private final SenderTelemetry telemetry=new SenderTelemetry(System.nanoTime());
     private final Runnable statistics=new Runnable(){
         @Override public void run(){
             final PeerConnection current=peer;
             if(current!=null && remoteSet)current.getStats(report -> main.post(() -> {
                 if(peer!=current || closing)return;
-                for(RTCStats stat:report.getStatsMap().values()){
+                java.util.Map<String,RTCStats> stats=report.getStatsMap();
+                java.util.Map<String,Object> video=null, codec=null;
+                for(RTCStats stat:stats.values()){
                     if(!"outbound-rtp".equals(stat.getType()))continue;
                     java.util.Map<String,Object> members=stat.getMembers();
                     if(!"video".equals(members.get("kind")) || !members.containsKey("framesEncoded"))continue;
-                    long now=System.nanoTime(), frames=number(members.get("framesEncoded")).longValue();
-                    double actual=lastStatsNs==0 ? 0 : Math.max(0,frames-lastFrames)*1e9/Math.max(1,now-lastStatsNs);
-                    lastStatsNs=now;lastFrames=frames;
-                    send(json("type","telemetry","session",String.valueOf(generation),
-                            "encodedFps",actual,"width",number(members.get("frameWidth")).intValue(),
-                            "height",number(members.get("frameHeight")).intValue(),
-                            "volume",phoneVolume(),
-                            "limitation",String.valueOf(members.getOrDefault("qualityLimitationReason","unknown"))));
+                    video=members;
                 }
+                if(video!=null){
+                    Object codecId=video.get("codecId");
+                    RTCStats codecStat=codecId==null?null:stats.get(String.valueOf(codecId));
+                    if(codecStat!=null && "codec".equals(codecStat.getType()))codec=codecStat.getMembers();
+                }
+                // Old-schema fields (encodedFps/width/height/limitation) stay present; the optional
+                // measurement fields are added only when actually measured.
+                JSONObject message=json("type","telemetry","session",String.valueOf(generation),
+                        "volume",phoneVolume(),"sampledMonotonicMs",SystemClock.elapsedRealtime());
+                for(java.util.Map.Entry<String,Object> field
+                        :telemetry.sample(System.nanoTime(),thermalStatus(),video,codec).entrySet()){
+                    try{message.put(field.getKey(),field.getValue());}catch(Exception ignored){}
+                }
+                send(message);
             }));
             if(!closing)main.postDelayed(this,1000);
         }
     };
-    private static Number number(Object value){return value instanceof Number ? (Number)value : 0;}
     private final Runnable renewWake=new Runnable(){
         @Override public void run(){
             if(!closing && wake!=null){wake.acquire(10*60*1000L);main.postDelayed(this,5*60*1000L);}
@@ -156,12 +165,15 @@ public class ProjectionService extends Service {
                 @Override public void onCapturerStarted(boolean success){downstream.onCapturerStarted(success);}
                 @Override public void onCapturerStopped(){downstream.onCapturerStopped();}
                 @Override public void onFrameCaptured(VideoFrame frame){
-                    if(!pacer.accept(frame.getTimestampNs(),fps))return;
+                    boolean paced=pacer.accept(frame.getTimestampNs(),fps);
+                    telemetry.onFrame(frame.getTimestampNs(),paced);
+                    if(!paced)return;
                     downstream.onFrameCaptured(frame);
                 }
             });
             int[] size=captureSize(0,0);capturer.startCapture(size[0],size[1],fps);
             source.adaptOutputFormat(size[0],size[1],fps);
+            telemetry.setCaptureFormat(size[0],size[1]);
             track=factory.createVideoTrack("airframe-screen",source);
             http=new OkHttpClient.Builder().pingInterval(15,TimeUnit.SECONDS).connectTimeout(10,TimeUnit.SECONDS).readTimeout(0,TimeUnit.SECONDS).build();
             connect();
@@ -281,6 +293,7 @@ public class ProjectionService extends Service {
         int[] size=captureSize(contentWidth,contentHeight);
         capturer.changeCaptureFormat(size[0],size[1],fps);
         source.adaptOutputFormat(size[0],size[1],fps);
+        telemetry.setCaptureFormat(size[0],size[1]);
     }
 
     private void configure(JSONObject settings) {
@@ -296,6 +309,17 @@ public class ProjectionService extends Service {
     private static int setting(JSONObject settings,String key,int fallback) {
         int value=settings.optInt(key,0);
         return value>0 ? value : fallback;
+    }
+
+    /** System thermal status where Android exposes it (API 29+); unknown is never 0. */
+    private int thermalStatus() {
+        if(Build.VERSION.SDK_INT<29)return SenderTelemetry.UNKNOWN_THERMAL;
+        try{
+            PowerManager pm=(PowerManager)getSystemService(POWER_SERVICE);
+            return pm==null?SenderTelemetry.UNKNOWN_THERMAL:pm.getCurrentThermalStatus();
+        }catch(Exception error){
+            return SenderTelemetry.UNKNOWN_THERMAL;
+        }
     }
 
     private int phoneVolume() {
@@ -459,7 +483,7 @@ public class ProjectionService extends Service {
     }
 
     private void closePeer() {
-        lastFrames=0;lastStatsNs=0;generation++;remoteSet=false;negotiating=false;restartPending=false;pendingIce.clear();
+        telemetry.reset(System.nanoTime());generation++;remoteSet=false;negotiating=false;restartPending=false;pendingIce.clear();
         if(restartTask!=null)main.removeCallbacks(restartTask);
         if(stableTask!=null)main.removeCallbacks(stableTask);
         audioChannel=null;stopAudio();
