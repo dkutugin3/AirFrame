@@ -1,7 +1,11 @@
 # ACCEPTANCE — final-acceptance harness for plan §13.B (60 FPS) and §13.C (quality)
 
-Owner: bench-harness (task-15). Status: harness implemented, short dry run executed against
-the current BGRA path; physical external capture **is available on this macOS host** (details below).
+Owner: bench-harness (task-15). Status: harness implemented and dry-run validated against the
+BGRA path; physical external capture **is available on this macOS host in principle** (details
+below), but the **final §13.B/§13.C acceptance runs for the new YUV/RHI output path were NOT
+performed in the 2026-10-30 run** because the user kept the display's active Space occupied and no
+agent may switch Spaces (Accessibility denied). The harness refuses to record the wrong window
+(fail-closed). Authoritative outcome: `artifacts/2026-10-30-stable60fps/acceptance/FINAL-STATUS.md`.
 
 Files:
 - `scripts/acceptance-60fps.py` — native §13.B driver (real app + real WebRTC + external capture).
@@ -133,7 +137,7 @@ Tolerances (2026-10-30.1, fixed before the run — see the module for the author
 | black level delta / max absolute | 4 / 32 | 20 / 64 |
 | white level delta / min absolute | 6 / 200 | 24 / 168 |
 
-## 5. Dry-run result on this machine (current BGRA path, 2026-10-30)
+## 5. Dry-run results available in this run (BGRA path only — NOT the new output path)
 
 `--duration 15 --warmup 10 --width 1920 --height 1080` (source at profile resolution, 1:1 OBS
 window backing store, external recorder output 1280×720):
@@ -151,16 +155,82 @@ window backing store, external recorder output 1280×720):
 | remote source CPU / external recorder CPU | 99.6 % / 47.3 % | informational |
 | codec / decoder / capture size / receive bitrate | h264 / aiortc 1.15.0 software (FFmpeg) / 1280×720 / ~2.2–2.7 Mbps | informational |
 
-**All §13.B checks passed on the 15 s dry run.** A 10-minute run is still required for the
-final acceptance record; the dry run also establishes this BGRA baseline for comparing the
-stage 6–7 output path.
+**All §13.B checks passed on this 15 s dry run of the old BGRA path.** This recording predates
+the stage-6 YUV/RHI renderer and the stage-7 decoder wiring: it is the **baseline** for a future
+new-vs-old comparison and must **not** be presented as evidence for the new output path. A
+10-minute run on the final output path is still required for the final acceptance record
+(and the >99 % shared-host caveat in §6).
 
 §13.C dry run on the same recording (40 ID-aligned frames, analysis 640×360, pinned coding
 baseline 8000 kbps): coding floor **PSNR 57.5 dB mean / SSIM 0.9993**, capture/render path
 **27.5 dB mean / SSIM 0.9252**, colour patch delta 23.3, no U/V swap, both within the
 pre-registered capture tolerances. Crops are saved for visual review.
 
-## 6. What this harness does NOT prove
+## 6. Run status 2026-10-30 — physical capture skipped by user decision (frozen runtime 2b7a5cb)
+
+Runtime was frozen at HEAD `2b7a5cb8f9091a20a12d547f1e375ade0a2c2711` ("receiver: install the
+stage-7 decoder factory and surface honest hw-decode status"); at finalization the runtime files
+were clean. The following was decided by the user and is recorded here so the acceptance record
+stays honest:
+
+* **(a) Not performed.** The final 10-minute §13.B acceptance run and the new-output-path §13.C
+  quality comparison were **not executed in this run**: the active macOS display Space was
+  occupied by the user's own full-screen application and no agent can switch Spaces
+  (Accessibility permission denied). The user explicitly chose to keep the display occupied and
+  skip physical capture. The harness refuses to record the wrong window (fail-closed, exit 2 with
+  the exact on-screen window stack; three preserved attempts are listed in `FINAL-STATUS.md`).
+  No app/OBS configuration was modified.
+* **(b) Only real external-capture evidence is the old BGRA dry run.**
+  `acceptance/dry-run/acceptance-60fps-capture.mp4` (sha256
+  `5e4b69d943d2c1b99222abc5fd111ea10bc55bdb09847d2e9bd128026ebb864f`): 897/899 = **99.78 %**
+  unique IDs, p99 interval **16.67 ms**, 0 holds > 50 ms, 0 underflows, app CPU 44 % / RSS
+  306 MiB, recorder ffmpeg/avfoundation. It **predates the stage-6 YUV/RHI renderer** and must not
+  be used as evidence for the new output path. Same for `acceptance/quality-dry-run/` (coding
+  floor PSNR 57.5 dB / SSIM 0.9993; capture path 27.5 dB / 0.9252 on that BGRA recording).
+* **(c) New output path evidence is native, not physical.** native-gpu verified the renderer
+  contract, real-window Metal RHI colour (24/24 patches within **±2 ITU-R code values**, BT.601+
+  full routed to the software conversion) and exact 1:1 physical output size on a real window
+  (`artifacts/2026-10-30-stable60fps/native/render-real-verification.json`,
+  `render-real-exact-size.json/.png`, report `reports/native-gpu.md`). That is **not**
+  physical-presentation or OBS-capture evidence.
+* **(d) Unverified.** Physical 60 FPS through the final output path and its OBS/external capture
+  **remain unverified on this machine for this run**. The host was shared (other apps/windows
+  running); it is not a dedicated benchmark machine.
+
+To complete the runs later, on a free display / exclusive machine:
+
+```sh
+cd <repo>
+sh scripts/setup-native-tests.sh
+export PYTHONPATH="$PWD/.superpowers/native-deps"
+
+# 1) short §13.B dry run: validates that the external recorder captures the final renderer output
+.venv/bin/python scripts/acceptance-60fps.py --duration 15 --warmup 5 \
+    --width 1920 --height 1080 \
+    --out artifacts/2026-10-30-stable60fps/acceptance/dry-run-final-output/
+
+# 2) final 10-minute §13.B run (exclusive display/CPU; plan §13.B)
+.venv/bin/python scripts/acceptance-60fps.py --duration 600 --warmup 10 \
+    --width 1920 --height 1080 \
+    --out artifacts/2026-10-30-stable60fps/acceptance/final-60fps/
+
+# 3) §13.C: new output path vs the BGRA baseline recording (ID-aligned, pre-registered tolerances)
+.venv/bin/python scripts/quality-compare.py \
+    --capture artifacts/2026-10-30-stable60fps/acceptance/final-60fps/acceptance-60fps-capture.mp4 \
+    --baseline artifacts/2026-10-30-stable60fps/acceptance/dry-run/acceptance-60fps-capture.mp4 \
+    --out artifacts/2026-10-30-stable60fps/acceptance/quality-final-vs-bgra
+```
+
+Fail-closed conditions (exit 2, reason recorded, no recording used as evidence): the OBS window is
+not on the active display Space; another app is frontmost; the probe recording has no decodable
+bench frame IDs; > 2 % of captured frames have no decodable ID; or the recorder fails. Activating
+the OBS window cannot switch Spaces on this machine (Accessibility denied), so a genuinely free
+display is required.
+
+Full details and the preserved failure evidence: `acceptance/FINAL-STATUS.md`,
+`acceptance/dry-run-stage6-STATUS.md`.
+
+## 7. What this harness does NOT prove
 
 - It records the **composited screen pixels** of the AirFrame OBS window. That is physical
   output evidence for this machine, but it is not an OBS-application recording unless OBS
@@ -171,6 +241,9 @@ pre-registered capture tolerances. Crops are saved for visual review.
   separately and never uses it as a substitute for the recording.
 - No GPU-acceleration, Windows, or Android/Wi-Fi claim. The sender is a local synthetic
   source, not a phone; plan §13.D (real Android) is separate.
+- No claim is made for the stage-6 YUV/RHI + stage-7 output path in this run: its physical 60 FPS
+  and external/OBS capture are unverified (see §6), and the native colour/exact-size verification
+  is not presentation evidence.
 - PSNR/SSIM are necessary but not sufficient for quality: the saved crops must be inspected;
   the report says so.
 - The 20-bit frame ID wraps after ≈4.8 h at 60 FPS; acceptance runs are shorter (or restart).
