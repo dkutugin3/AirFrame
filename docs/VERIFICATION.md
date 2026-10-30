@@ -65,7 +65,14 @@ the point: the same interpreter/aiortc/PyAV as the Docker test stage.
 
 | Proves | Does not prove |
 |---|---|
-| Protocol, playout/RTP math, receiver/decoder integration, real H.264 over WebRTC, telemetry validation, bench-source/metrics units pass in the pinned Linux environment. | Qt/GUI, GPU, hardware decode, OBS capture, physical display, Android, Windows, long-duration stability. |
+| Protocol, playout/RTP math, receiver/decoder integration, real H.264 over WebRTC, telemetry validation **and its pass-through through `receiver.py` into `on_stats`**, bench-source/metrics units pass in the pinned Linux environment. | Qt/GUI, GPU, hardware decode, OBS capture, physical display, Android, Windows, long-duration stability, real phone telemetry values. |
+
+Stage-5b pass-through tests: `TelemetryPassThroughTests` (old payload unchanged,
+optional fields reach `sender_stats`, absent stays absent, bounded keys,
+first sample/counter reset/new session) and
+`TelemetrySignalingTests.test_telemetry_reaches_on_stats_through_signaling`
+(real signaling + WebRTC session, sender telemetry appears in the receiver's
+periodic `on_stats`) in `tests/test_receiver.py`.
 
 ### 1.3 Stage-0 measurement stand (bench)
 
@@ -245,9 +252,6 @@ commands/scripts are **not committed**, so they are intentionally absent from
   *contract* tests are already in `tests_native/`, but a real-window/GPU
   verification command is not committed yet. Probe images under
   `artifacts/2026-10-30-stable60fps/native/` are preliminary, not acceptance.
-- Receiver telemetry pass-through (new optional fields reaching the desktop from
-  a real sender) — task-8, blocked on the receiver queue work.
-
 When those land, add their exact command, what it proves and its evidence path to
 this document and (if deterministic) to `scripts/verify.sh`.
 
