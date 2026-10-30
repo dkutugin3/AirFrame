@@ -14,3 +14,7 @@ android/local.properties
 *.keystore
 
 android/signing/*.keystore
+
+# Local Docker CLI/buildx state used for sandboxed builds
+.docker/
+.superpowers/
