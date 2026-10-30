@@ -314,6 +314,8 @@ class Renderer:
         self._latest = None
         self._presented_serial = 0
         self._prepared_frames = 0
+        self._prepare_errors = 0
+        self.last_prepare_error = ""
         self._presented_frames = 0
         self._skipped_hidden = 0
         self._dropped_closed = 0
@@ -331,6 +333,15 @@ class Renderer:
         """
         self._active = bool(active)
 
+    def last_prepared(self):
+        """The newest prepared frame held for presentation, if any."""
+        return self._latest
+
+    def note_prepare_error(self, error):
+        """Called from the decode thread when prepare() raised; kept visible."""
+        self._prepare_errors += 1
+        self.last_prepare_error = str(error)
+
     def wants_frame(self):
         """False when a hidden/closed window must not spend conversion work."""
         return not self._closed and self._active
@@ -345,12 +356,12 @@ class Renderer:
     def _render(self, prepared):
         raise NotImplementedError
 
-    def present(self, prepared):
+    def present(self, prepared, hidden_ok=False):
         if self._closed:
             self._dropped_closed += 1
             return False
         self._latest = prepared
-        if not self._widget.isVisible():
+        if not self._widget.isVisible() and not hidden_ok:
             self._skipped_hidden += 1
             return False
         self._render(prepared)
@@ -392,6 +403,7 @@ class Renderer:
             "requestedMode": self.requested_mode,
             "prepared": self._prepared_frames,
             "framesPrepared": self._prepared_frames,
+            "framesPrepareErrors": self._prepare_errors,
             "framesPresented": self._presented_frames,
             "framesSkippedHidden": self._skipped_hidden,
             "framesDroppedClosed": self._dropped_closed,
@@ -530,6 +542,7 @@ class SoftwareVideoRenderer(Renderer):
             height=frame.height,
             rotation=rotation,
             image=image,
+            source=frame,
         )
 
     def _render(self, prepared):

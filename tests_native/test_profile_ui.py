@@ -88,7 +88,8 @@ class ProfileAckTests(unittest.TestCase):
             window.apply_button.click()
             qt_harness.pump_until(lambda: "Сохранено" in window.profile_result.text(),
                                   description="offline profile save")
-            self.assertEqual(server.room.settings, requested)
+            self.assertEqual(server.room.saved_profile, requested)
+            self.assertEqual(server.room.effective_profile, server.room.settings)
             self.assertNotIn("подтвердил", window.profile_result.text())
             self.assertTrue(window.apply_button.isEnabled())
             self.assertEqual(window.profile_ack_state, "saved")
@@ -149,7 +150,8 @@ class ProfileAckTests(unittest.TestCase):
             self.assertEqual(window.profile_ack_state, "timeout")
             # An unconfirmed profile is saved for the next connection, not
             # reported as applied to the running phone.
-            self.assertEqual(server.room.settings, requested)
+            self.assertEqual(server.room.saved_profile, requested)
+            self.assertNotEqual(server.room.effective_profile, requested)
             configure = scenario.sender.received("configure")
             self.assertEqual(len(configure), 1)
             request_id = configure[0]["requestId"]
@@ -158,7 +160,8 @@ class ProfileAckTests(unittest.TestCase):
                                   "applied": True, "settings": configure[0]["settings"]})
             qt_harness.pump_for(0.3)
             self.assertEqual(window.profile_ack_state, "timeout")
-            self.assertEqual(server.room.settings, requested)
+            self.assertEqual(server.room.saved_profile, requested)
+            self.assertNotEqual(server.room.effective_profile, requested)
             # A late acknowledgement for the real request still reconciles honestly.
             scenario.sender.send({"type": "configured", "requestId": request_id,
                                   "applied": True, "settings": configure[0]["settings"]})

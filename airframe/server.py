@@ -289,13 +289,19 @@ class Room:
         self.resume_token = ""
         self.resume_until = 0.0
         self.peers = {}
-        self.settings = dict(DEFAULTS)
-        # A profile requested while a sender is connected is only effective once
-        # the phone acknowledges it; until then the previous profile is kept.
+        # The session runs the *effective* profile; the user's wish is *saved*
+        # immediately but becomes effective only through the phone's applied ack.
+        self.effective_profile = dict(DEFAULTS)
+        self.saved_profile = dict(DEFAULTS)
         self.pending_profile = None
         self.failures = defaultdict(deque)
         self.total_failures = deque()
         self.rotate_code()
+
+    @property
+    def settings(self):
+        """Legacy name for the profile the session actually runs."""
+        return self.effective_profile
 
     def rotate_code(self):
         self.qr_token = secrets.token_urlsafe(24)
@@ -329,24 +335,27 @@ class Room:
         return False
 
     def request_profile(self, settings, request_id=""):
-        """Validate a receiver-requested profile and remember what it replaces.
+        """Save the user's wish; effective only after acknowledge_profile().
 
-        The request is saved right away for the next connection; while a sender
-        is connected it becomes effective only after acknowledge_profile().
+        The wish is stored right away for the next connection. While a sender
+        is connected the request also becomes pending: the phone is asked to
+        apply it, and only its applied ack makes it effective. Returns the
+        saved wish for forwarding to the sender.
         """
         settings = video_settings(settings)
-        previous = dict(self.settings)
-        self.settings = settings
-        self.pending_profile = ({"requestId": request_id, "previous": previous}
-                                if "sender" in self.peers else None)
-        return settings
+        self.saved_profile = settings
+        if "sender" in self.peers:
+            self.pending_profile = {"requestId": request_id, "settings": dict(settings)}
+        return dict(settings)
 
     def acknowledge_profile(self, message):
         """Reconcile the phone's acknowledgement with the effective profile.
 
-        An acknowledgement for an unknown/stale request cannot change the
-        session profile. A rejection keeps the previously effective profile; an
-        applied change adopts the settings the phone actually reports.
+        An acknowledgement for an unknown/stale/superseded request cannot
+        change anything. A rejection keeps the previously effective profile
+        and the saved wish; an applied change adopts the settings the phone
+        actually reports. Returns the new effective profile, or None when the
+        acknowledgement did not match the pending request.
         """
         pending = self.pending_profile
         if pending is None or message.get("requestId") != pending["requestId"]:
@@ -354,12 +363,13 @@ class Room:
         self.pending_profile = None
         if message.get("applied") is True:
             try:
-                self.settings = video_settings(message.get("settings"))
+                self.effective_profile = video_settings(message.get("settings"))
             except ValueError:
-                self.settings = video_settings(pending["previous"])
-        else:
-            self.settings = video_settings(pending["previous"])
-        return dict(self.settings)
+                pass  # A malformed applied ack keeps the previous effective profile.
+        adopt = getattr(self.peers.get("receiver"), "effective_profile_changed", None)
+        if callable(adopt):
+            adopt()
+        return dict(self.effective_profile)
 
     async def send(self, role, message):
         peer = self.peers.get(role)
@@ -372,7 +382,11 @@ class Room:
     async def ready(self):
         if all(role in self.peers for role in ("sender", "receiver")):
             await self.send("receiver", {"type": "peer-ready"})
-            await self.send("sender", {"type": "peer-ready", "settings": self.settings})
+            # A joining phone is asked for the saved wish; when it differs from
+            # the effective profile its applied ack is required to switch over.
+            await self.send("sender", {"type": "peer-ready", "settings": dict(self.saved_profile)})
+            if self.saved_profile != self.effective_profile:
+                self.pending_profile = {"requestId": "", "settings": dict(self.saved_profile)}
 
 
 @web.middleware
@@ -410,7 +424,11 @@ async def session(request):
     if time.monotonic() >= room.code_until:
         room.rotate_code()
     return web.json_response({"code": room.code, "expiresIn": int(room.code_until - time.monotonic()),
-                              "addresses": lan_addresses(), "settings": room.settings,
+                              "addresses": lan_addresses(),
+                              "settings": room.settings,
+                              "effectiveSettings": room.effective_profile,
+                              "savedSettings": room.saved_profile,
+                              "pendingRequestId": (room.pending_profile or {}).get("requestId"),
                               "senderConnected": "sender" in room.peers})
 
 

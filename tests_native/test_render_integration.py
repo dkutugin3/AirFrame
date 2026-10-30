@@ -107,24 +107,28 @@ class DesktopIntegrationTests(unittest.TestCase):
         self.assertIsNotNone(image)
         self.assertEqual((image.width(), image.height()), (32, 18))
 
-    def test_hidden_obs_window_does_no_prepare_work_and_main_preview_still_renders(self):
+    def test_hidden_obs_pane_stays_ready_and_main_preview_still_renders(self):
+        """Review I6: the OBS output pane keeps preparing while its window is
+        closed (opening must show the newest frame at once and a broken
+        preview must not stop the recording output); the main preview keeps
+        rendering and the GPU path still avoids per-frame BGRA conversion."""
         window = self._window()
         with ReformatCounter() as counter:
             for _ in range(5):
                 self._put(fx.solid_frame(64, 36, 100, 128, 128))
         self.assertEqual(counter.calls, 0, "GPU-path preparation must not use BGRA conversion")
         self.assertEqual(window.surface.renderer.stats()["framesPrepared"], 5)
-        self.assertEqual(window.obs_pane.renderer.stats()["framesPrepared"], 0,
-                         "a hidden OBS window prepared frames nobody can see")
+        self.assertEqual(window.obs_pane.renderer.stats()["framesPrepared"], 5,
+                         "the hidden OBS pane must hold the newest prepared frame")
         window.open_obs()
         qt_harness.pump_for(0.05)
-        # Becoming visible costs exactly one catch-up conversion of the latest frame.
-        self.assertEqual(window.obs_pane.renderer.stats()["framesPrepared"], 1)
-        self.assertEqual(window.obs_pane.renderer.stats()["framesPresented"], 1)
-        before = window.obs_pane.renderer.stats()["framesPrepared"]
+        # The held frame is already prepared: opening presents it without a
+        # catch-up conversion and without a visible flash of stale content.
+        self.assertEqual(window.obs_pane.renderer.stats()["framesPrepared"], 5)
+        before = window.obs_pane.renderer.stats()["framesPresented"]
         self._put(fx.solid_frame(64, 36, 120, 128, 128))
         self.assertGreater(window.obs_pane.renderer.stats()["framesPrepared"], before)
-        self.assertEqual(window.obs_pane.renderer.stats()["framesPresented"], 2)
+        self.assertGreater(window.obs_pane.renderer.stats()["framesPresented"], before)
 
     def test_two_windows_share_one_decoded_frame(self):
         window = self._window()

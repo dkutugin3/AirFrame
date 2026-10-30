@@ -438,3 +438,150 @@ class TelemetryDiagnosticsTests(unittest.TestCase):
                                                           "encodedFps":None,"sentFps":None},
                                                received_fps=None,target_fps=60))
         self.assertIn("Счётчики сброшены",reset)
+
+
+class ProfileEffectiveSignalingTests(AioHTTPTestCase):
+    """I3: saved wish vs effective profile, timeout never applies the wish."""
+    get_application = SignalingTests.get_application
+    connect = SignalingTests.connect
+    BASE = {"fps": 60, "bitrate": 24, "maxSize": 2560}
+
+    async def pair(self):
+        receiver, _ = await self.connect('receiver')
+        sender, _ = await self.connect('sender')
+        await receiver.receive_json(timeout=2)   # peer-ready
+        await sender.receive_json(timeout=2)     # peer-ready
+        return receiver, sender
+
+    async def session(self):
+        response = await self.client.get(
+            '/api/session', headers={"Authorization": f"Bearer {self.room.receiver_token}"})
+        self.assertEqual(response.status, 200)
+        return await response.json()
+
+    async def test_session_api_names_effective_saved_and_pending(self):
+        receiver, sender = await self.pair()
+        try:
+            await receiver.send_json({'type': 'configure', 'requestId': 'want-30',
+                                      'settings': {'fps': 30, 'bitrate': 10, 'maxSize': 1920}})
+            await sender.receive_json(timeout=2)
+            data = await self.session()
+            self.assertEqual(data['settings'], self.BASE)          # legacy field = effective
+            self.assertEqual(data['effectiveSettings'], self.BASE)
+            self.assertEqual(data['savedSettings'],
+                             {'fps': 30, 'bitrate': 10, 'maxSize': 1920})
+            self.assertEqual(data['pendingRequestId'], 'want-30')
+        finally:
+            await sender.close(); await receiver.close()
+
+    async def test_unacked_request_keeps_effective_and_saves_wish(self):
+        receiver, sender = await self.pair()
+        try:
+            await receiver.send_json({'type': 'configure', 'requestId': 'want-30',
+                                      'settings': {'fps': 30, 'bitrate': 10, 'maxSize': 1920}})
+            configure = await sender.receive_json(timeout=2)
+            self.assertEqual(configure['settings'], {'fps': 30, 'bitrate': 10, 'maxSize': 1920})
+            # The phone has not acknowledged: the session must NOT be run at 30 fps.
+            self.assertEqual(self.room.settings, self.BASE)
+            self.assertEqual(self.room.effective_profile, self.BASE)
+            self.assertEqual(self.room.saved_profile,
+                             {'fps': 30, 'bitrate': 10, 'maxSize': 1920})
+            self.assertIsNotNone(self.room.pending_profile)
+        finally:
+            await sender.close(); await receiver.close()
+
+    async def test_rejection_keeps_effective_and_saved_wish(self):
+        receiver, sender = await self.pair()
+        try:
+            wanted = {'fps': 30, 'bitrate': 10, 'maxSize': 1920}
+            await receiver.send_json({'type': 'configure', 'requestId': 'r1', 'settings': wanted})
+            await sender.receive_json(timeout=2)
+            await sender.send_json({'type': 'configured', 'requestId': 'r1',
+                                    'applied': False, 'settings': wanted})
+            await receiver.receive_json(timeout=2)
+            self.assertEqual(self.room.effective_profile, self.BASE)  # previous stays effective
+            self.assertEqual(self.room.saved_profile, wanted)         # wish preserved
+            self.assertIsNone(self.room.pending_profile)
+        finally:
+            await sender.close(); await receiver.close()
+
+    async def test_silence_timeout_keeps_effective_and_saved_wish(self):
+        receiver, sender = await self.pair()
+        try:
+            wanted = {'fps': 30, 'bitrate': 10, 'maxSize': 1920}
+            await receiver.send_json({'type': 'configure', 'requestId': 'r-timeout',
+                                      'settings': wanted})
+            await sender.receive_json(timeout=2)
+            # The desktop times out after 10 s without an ack; the server state is the
+            # same as during silence: effective untouched, wish saved, request pending.
+            self.assertEqual(self.room.effective_profile, self.BASE)
+            self.assertEqual(self.room.saved_profile, wanted)
+            self.assertEqual(self.room.pending_profile['requestId'], 'r-timeout')
+        finally:
+            await sender.close(); await receiver.close()
+
+    async def test_applied_request_updates_effective_and_saved(self):
+        receiver, sender = await self.pair()
+        try:
+            wanted = {'fps': 30, 'bitrate': 10, 'maxSize': 1920}
+            await receiver.send_json({'type': 'configure', 'requestId': 'r-applied',
+                                      'settings': wanted})
+            await sender.receive_json(timeout=2)
+            await sender.send_json({'type': 'configured', 'requestId': 'r-applied',
+                                    'applied': True, 'settings': wanted})
+            await receiver.receive_json(timeout=2)
+            self.assertEqual(self.room.effective_profile, wanted)
+            self.assertEqual(self.room.saved_profile, wanted)
+        finally:
+            await sender.close(); await receiver.close()
+
+    async def test_overlapping_requests_do_not_chain_from_an_unacked_wish(self):
+        receiver, sender = await self.pair()
+        try:
+            await receiver.send_json({'type': 'configure', 'requestId': 'a',
+                                      'settings': {'fps': 30, 'bitrate': 10, 'maxSize': 1920}})
+            await sender.receive_json(timeout=2)
+            await receiver.send_json({'type': 'configure', 'requestId': 'b',
+                                      'settings': {'fps': 120, 'bitrate': 80, 'maxSize': 2560}})
+            await sender.receive_json(timeout=2)
+            # A stale ack for the superseded request cannot change anything.
+            await sender.send_json({'type': 'configured', 'requestId': 'a', 'applied': True,
+                                    'settings': {'fps': 30, 'bitrate': 10, 'maxSize': 1920}})
+            await receiver.receive_json(timeout=2)
+            self.assertEqual(self.room.effective_profile, self.BASE)
+            # Rejecting the current wish keeps the previous effective profile and the wish.
+            await sender.send_json({'type': 'configured', 'requestId': 'b', 'applied': False,
+                                    'settings': {'fps': 120, 'bitrate': 80, 'maxSize': 2560}})
+            await receiver.receive_json(timeout=2)
+            self.assertEqual(self.room.effective_profile, self.BASE)
+            self.assertEqual(self.room.saved_profile,
+                             {'fps': 120, 'bitrate': 80, 'maxSize': 2560})
+        finally:
+            await sender.close(); await receiver.close()
+
+    async def test_offline_save_updates_saved_only_then_applies_on_ack(self):
+        receiver, _ = await self.connect('receiver')
+        try:
+            wanted = {'fps': 30, 'bitrate': 10, 'maxSize': 1920}
+            await receiver.send_json({'type': 'configure', 'requestId': 'offline',
+                                      'settings': wanted})
+            data = await self.session()
+            self.assertEqual(data['effectiveSettings'], self.BASE)
+            self.assertEqual(data['savedSettings'], wanted)
+            self.assertIsNone(data['pendingRequestId'])
+            self.assertEqual(self.room.effective_profile, self.BASE)
+            # A phone joining later is asked for the saved wish; its ack makes it effective.
+            sender, _ = await self.connect('sender')
+            ready = await sender.receive_json(timeout=2)
+            self.assertEqual(ready['settings'], wanted)
+            self.assertIsNotNone(self.room.pending_profile)
+            await sender.send_json({'type': 'configured', 'requestId': '',
+                                    'applied': True, 'settings': wanted})
+            # peer-ready for the receiver is queued ahead of the ack: drain to it.
+            while True:
+                note = await receiver.receive_json(timeout=2)
+                if note.get('type') == 'configured':
+                    break
+            self.assertEqual(self.room.effective_profile, wanted)
+        finally:
+            await receiver.close()

@@ -135,14 +135,25 @@ class Frames:
                 try:
                     if not renderer.wants_frame():
                         continue
-                    if key == "preview" and stride > 1 and serial % stride:
+                    if key == "preview" and stride > 1 and serial % stride == 0:
                         continue
                     ready[key] = renderer.prepare(frame, serial=serial)
-                except Exception:
+                except Exception as error:
                     # One broken output must not stop the other one or the mailbox.
+                    renderer.note_prepare_error(error)
                     continue
         with self.lock:
-            self.ready = ready
+            # Keep the newest prepared frame per output: a dispatch may be
+            # pending while this put prepares, and a pane whose frame was
+            # skipped by the preview stride must not lose its earlier one.
+            for key, prepared in ready.items():
+                self.ready[key] = prepared
+            # C1: a dispatch may have consumed the previous batch while this
+            # put was preparing; re-arm the notification so the newest frame
+            # cannot be left unpresented after a slow prepare.
+            if not notify and not self.notification_pending:
+                notify = True
+                self.notification_pending = True
         if notify:
             self.notice.wake.emit()
         return serial
@@ -265,15 +276,15 @@ class LocalServer:
         async def apply():
             requested = video_settings(settings)
             sender_connected = "sender" in self.room.peers
-            # The request is saved for the next connection immediately; while a
+            # The wish is saved for the next connection immediately; while a
             # phone is connected it becomes effective only after its ack.
-            effective = self.room.request_profile(requested, request_id)
+            wish = self.room.request_profile(requested, request_id)
             if not sender_connected:
                 self.events.stats.emit({"configured": {"requestId": request_id, "saved": True,
-                                                       "settings": effective,
-                                                       "effective": dict(effective)}})
+                                                       "settings": wish,
+                                                       "effective": dict(self.room.effective_profile)}})
                 return
-            await self.room.send("sender", {"type": "configure", "settings": effective,
+            await self.room.send("sender", {"type": "configure", "settings": wish,
                                             "requestId": request_id})
         self.submit(apply())
 
@@ -311,7 +322,7 @@ class LocalServer:
 class VideoPane(QWidget):
     """One video output surface: the renderer widget plus the idle preview placeholder."""
 
-    def __init__(self, renderer_factory, preview=False, parent=None):
+    def __init__(self, renderer_factory, preview=False, parent=None, always_active=False):
         super().__init__(parent)
         self.preview = preview
         self.renderer = renderer_factory()
@@ -328,9 +339,15 @@ class VideoPane(QWidget):
         self.placeholder.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
         self.placeholder.setStyleSheet("QLabel {background:#151d19;color:#b6f5a1;font-size:16px;}")
         self.placeholder.setVisible(bool(preview))
+        # The OBS output pane keeps preparing and holding the newest frame even
+        # while its window is closed: opening the window must show it at once,
+        # and a broken preview must not stop the recording output.
+        self.always_active = always_active
+        self.renderer.set_active(always_active)
 
     def set_active(self, active):
-        self.renderer.set_active(active)
+        if not self.always_active:
+            self.renderer.set_active(active)
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
@@ -346,7 +363,7 @@ class VideoPane(QWidget):
         self.renderer.set_active(False)
 
     def present(self, prepared):
-        if self.renderer.present(prepared):
+        if self.renderer.present(prepared, hidden_ok=self.always_active):
             if self.preview:
                 self.placeholder.hide()
 
@@ -583,7 +600,7 @@ class Desktop(QMainWindow):
         # Frameless: a "window capture" source in OBS gets only the video, not a title bar.
         self.obs.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
         self.obs.resize(1280, 720)
-        self.obs_pane = VideoPane(self.renderer_factory)
+        self.obs_pane = VideoPane(self.renderer_factory, always_active=True)
         self.obs.setCentralWidget(self.obs_pane)
         self.obs.installEventFilter(self)
         self._exact_size = None
@@ -904,9 +921,12 @@ class Desktop(QMainWindow):
         if getattr(self, "closing", False):
             return
         ready = self.server.frames.take_ready()
+        output_prepared = None
         for key, prepared in ready.items():
             pane = self.obs_pane if key == "obs" else self.surface
             pane.present(prepared)
+            if key == "obs" or output_prepared is None:
+                output_prepared = prepared
         latest = self.server.frames.latest()
         if latest is None or latest[1] is None:
             self.surface.clear()
@@ -914,7 +934,7 @@ class Desktop(QMainWindow):
         else:
             # The exact output size follows the stream, independent of the
             # preview throttling (the preview may skip this serial entirely).
-            self._apply_output_size()
+            self._apply_output_size(output_prepared)
         self._refresh_output_diag()
 
     def exact_output_toggled(self, checked):
@@ -926,19 +946,36 @@ class Desktop(QMainWindow):
         elif checked:
             self._apply_output_size()
 
+    def _device_pixel_ratio(self):
+        """Hook so tests can pin the DPR of the target display explicitly."""
+        return self.obs.devicePixelRatioF() or 1.0
+
+    def output_size(self, prepared=None):
+        """Rotated physical output size of the current stream."""
+        if prepared is not None:
+            return prepared.output_size()
+        for pane in (self.obs_pane, self.surface):
+            held = pane.renderer.last_prepared()
+            if held is not None:
+                return held.output_size()
+        latest = self.server.frames.latest()
+        frame = latest[1] if latest is not None else None
+        if frame is None:
+            return None
+        size = QSize(frame.width, frame.height)
+        if video_render.display_rotation_from_frame(frame) in (90, 270):
+            size.transpose()
+        return size
+
     def _apply_output_size(self, prepared=None):
         """Exact mode: the OBS window's device pixels equal the stream pixels."""
-        frame = prepared
-        if frame is None:
-            latest = self.server.frames.latest()
-            if latest is None or latest[1] is None:
-                return
-            frame = latest[1]
-        width, height = frame.width, frame.height
         if not self.exact_output.isChecked():
             return
-        dpr = self.obs.devicePixelRatioF() or 1.0
-        logical = video_render.exact_window_size(QSize(width, height), dpr)
+        physical = self.output_size(prepared)
+        if physical is None:
+            return
+        dpr = self._device_pixel_ratio()
+        logical = video_render.exact_window_size(physical, dpr)
         size = (logical.width(), logical.height())
         if size != self._exact_size:
             self.obs.setFixedSize(logical)
@@ -950,18 +987,21 @@ class Desktop(QMainWindow):
             return
         lines = ["Вывод предпросмотра: " + self.surface.renderer.output_path(),
                  "Вывод окна OBS: " + self.obs_pane.renderer.output_path()]
-        latest = self.server.frames.latest()
-        frame = latest[1] if latest is not None else None
-        if frame is not None:
-            dpr = self.obs.devicePixelRatioF() or 1.0
+        output = self.output_size()
+        if output is not None:
+            dpr = self._device_pixel_ratio()
             physical = video_render.physical_size(self.obs.size(), dpr)
-            scale = physical.width() / frame.width if frame.width else 0.0
+            scale = physical.width() / output.width() if output.width() else 0.0
             exact = " · точно 1:1" if abs(scale - 1.0) < 0.01 else ""
             lines.append(
-                f"Кадр: {frame.width} × {frame.height} px · окно OBS "
+                f"Кадр (с поворотом): {output.width()} × {output.height()} px · окно OBS "
                 f"{self.obs.width()}×{self.obs.height()} лог. = "
                 f"{physical.width()}×{physical.height()} физ. px · масштаб {scale:.2f}{exact}"
             )
+        for name, renderer in (("предпросмотр", self.surface.renderer), ("OBS", self.obs_pane.renderer)):
+            errors = renderer.stats().get("framesPrepareErrors", 0)
+            if errors:
+                lines.append(f"Ошибки подготовки ({name}): {errors} · последняя: {renderer.last_prepare_error}")
         reasons = []
         for name, renderer in (("предпросмотр", self.surface.renderer), ("OBS", self.obs_pane.renderer)):
             if renderer.fallback_reason:

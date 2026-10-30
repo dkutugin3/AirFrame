@@ -74,6 +74,9 @@ class Receiver:
                     stats[key] = message[key]
             self.sender_stats = stats
         elif kind == "configured":
+            # In the desktop process the ack reaches the Room through here;
+            # when a signaling server already reconciled it this is a no-op.
+            self.room.acknowledge_profile(message)
             self.on_stats({"configured": message})
         elif kind == "offer":
             await self.offer(message)
@@ -160,6 +163,17 @@ class Receiver:
             yield
         finally:
             manager.__exit__(None, None, None)
+
+    def effective_profile_changed(self):
+        """The phone's applied ack changed the effective profile: adopt its fps.
+
+        Called by Room.acknowledge_profile on the event loop; the playout
+        reserve is sized from fps, so a changed fps rebuilds the timeline.
+        """
+        fps = self.room.settings["fps"]
+        if fps != self.playout.fps:
+            self.playout.reset(fps=fps)
+            self.on_log(f"Профиль применён: резерв вывода пересобран под {fps} fps")
 
     def declared_answer(self, sdp):
         """Declare an H.264 level that covers the configured receive profile.

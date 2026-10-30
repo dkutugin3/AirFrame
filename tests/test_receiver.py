@@ -170,7 +170,7 @@ class PlayoutBudgetTests(unittest.IsolatedAsyncioTestCase):
         from fractions import Fraction
         from aiortc.mediastreams import MediaStreamError
         room = Room()
-        room.settings = {**room.settings, 'fps': 120, 'bitrate': 24, 'maxSize': 2560}
+        room.effective_profile = {**room.effective_profile, 'fps': 120, 'bitrate': 24, 'maxSize': 2560}
         logs, states, delivered = [], [], []
         receiver = Receiver(room, delivered.append, lambda *args: states.append(args),
                             lambda *args: None, logs.append)
@@ -473,7 +473,7 @@ class AnswerLevelTests(AioHTTPTestCase):
         return create_app(self.room)
 
     async def answer_for(self, settings):
-        self.room.settings = dict(settings)
+        self.room.effective_profile = dict(settings)
         sender = RTCPeerConnection(RTCConfiguration(iceServers=[]))
         sender.addTrack(VideoStreamTrack())
         capabilities = [codec for codec in RTCRtpSender.getCapabilities('video').codecs
@@ -515,7 +515,7 @@ class AnswerLevelTests(AioHTTPTestCase):
         self.assertEqual(self.levels(sdp), [0x28, 0x28], sdp)
 
     async def test_offer_without_h264_keeps_answer_unchanged(self):
-        self.room.settings = dict({'fps': 60, 'bitrate': 16, 'maxSize': 1920})
+        self.room.effective_profile = dict({'fps': 60, 'bitrate': 16, 'maxSize': 1920})
         sender = RTCPeerConnection(RTCConfiguration(iceServers=[]))
         sender.addTrack(VideoStreamTrack())
         capabilities = [codec for codec in RTCRtpSender.getCapabilities('video').codecs
@@ -667,3 +667,57 @@ class TelemetrySignalingTests(AioHTTPTestCase):
             await sender.close()
         await asyncio.sleep(.05)
         self.assertIsNone(self.receiver.peer)
+
+
+class EffectiveProfileReceiverTests(unittest.IsolatedAsyncioTestCase):
+    """I3/declared_answer: receiver reserve and answer level follow effective, not the wish."""
+
+    class Peer:
+        closed = False
+
+    def make_receiver(self):
+        self.stats, self.logs, self.states = [], [], []
+        room = self.room = Room()
+        receiver = Receiver(room, lambda frame: None,
+                            lambda *args: self.states.append(args),
+                            self.stats.append, self.logs.append)
+        room.peers['receiver'] = receiver
+        room.peers['sender'] = self.Peer()
+        return receiver
+
+    @staticmethod
+    def sdp():
+        return ("m=video 9 UDP/TLS/RTP/SAVPF 96\r\n"
+                "a=rtpmap:96 H264/90000\r\n"
+                "a=fmtp:96 profile-level-id=42001f;packetization-mode=1\r\n")
+
+    async def test_unacked_request_does_not_change_receiver_reserve(self):
+        receiver = self.make_receiver()
+        self.assertEqual(receiver.playout.max_frames, 24)      # 60 fps stable reserve
+        wanted = {'fps': 30, 'bitrate': 10, 'maxSize': 1920}
+        self.room.request_profile(wanted, 'wish-30')
+        self.assertEqual(self.room.effective_profile,
+                         {'fps': 60, 'bitrate': 24, 'maxSize': 2560})
+        self.assertEqual(self.room.saved_profile, wanted)
+        self.assertEqual(receiver.playout.max_frames, 24)      # still effective 60 fps
+        self.room.acknowledge_profile({'requestId': 'wish-30', 'applied': False,
+                                       'settings': wanted})
+        self.assertEqual(receiver.playout.max_frames, 24)
+        self.assertEqual(self.room.saved_profile, wanted)
+
+    async def test_declared_answer_uses_previous_effective_after_rejection(self):
+        receiver = self.make_receiver()
+        self.room.request_profile({'fps': 30, 'bitrate': 10, 'maxSize': 1920}, 'r1')
+        self.room.acknowledge_profile({'requestId': 'r1', 'applied': False,
+                                       'settings': {'fps': 30, 'bitrate': 10, 'maxSize': 1920}})
+        answer = receiver.declared_answer(self.sdp())
+        self.assertIn('profile-level-id=420033', answer.lower())   # 2560@60 effective
+        self.assertNotIn('profile-level-id=420028', answer.lower())  # not the 30 fps wish
+
+    async def test_declared_answer_uses_applied_effective_profile(self):
+        receiver = self.make_receiver()
+        applied = {'fps': 30, 'bitrate': 10, 'maxSize': 1920}
+        self.room.request_profile(applied, 'r2')
+        self.room.acknowledge_profile({'requestId': 'r2', 'applied': True, 'settings': applied})
+        answer = receiver.declared_answer(self.sdp())
+        self.assertIn('profile-level-id=420028', answer.lower())  # 1920@30 level
