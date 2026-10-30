@@ -8,6 +8,7 @@ from aiortc.mediastreams import MediaStreamError
 from aiortc.sdp import candidate_from_sdp
 
 from .decode import install_decoder_pipelines
+from .h264 import advertise_answer_level, level_name, rewrite_profile_level_id
 from .transport import VIDEO_LOSS_DEADLINE, install_video_buffers
 from .playout import Playout
 
@@ -103,12 +104,36 @@ class Receiver:
             self.on_log(f"Видеобуфер RTP: 2048 пакетов, потеря ждёт "
                         f"{VIDEO_LOSS_DEADLINE*1000:.0f} мс, без дополнительной задержки вывода")
             await current.setLocalDescription(await current.createAnswer())
-            await self.room.send("sender", {"type": "answer", "session": self.session, "sdp": current.localDescription.sdp})
+            answer = self.declared_answer(current.localDescription.sdp)
+            await self.room.send("sender", {"type": "answer", "session": self.session, "sdp": answer})
             self.task(self.statistics(current))
         except Exception as exc:
             self.on_log(f"Не удалось согласовать видео: {exc}")
             self.on_state("error", "Ошибка формата видео. Повторите подключение.")
             await self.close_peer()
+
+    def declared_answer(self, sdp):
+        """Declare an H.264 level that covers the configured receive profile.
+
+        aiortc 1.15.0 always answers with level 3.1 (``42001f``/``42e01f``). At
+        2560 px / 60 fps level 5.1 is required, so a sender that honours the
+        declared level is told to downscale or fall back for no reason. Only the
+        level byte of the H.264 ``profile-level-id`` is rewritten (see
+        airframe/h264.py); ``level-asymmetry-allowed=1`` keeps the peer free to
+        send its own level. A settings/failure problem leaves the answer intact
+        and is logged, never silently pretended.
+        """
+        try:
+            settings = self.room.settings
+            level = advertise_answer_level(settings["maxSize"], settings["fps"])
+            rewritten = rewrite_profile_level_id(sdp, level)
+        except (KeyError, TypeError, ValueError) as exc:
+            self.on_log(f"H.264: не удалось объявить уровень приёма: {exc}")
+            return sdp
+        if rewritten != sdp:
+            self.on_log(f"H.264: приём объявлен уровнем {level_name(level)} "
+                        f"для {settings['maxSize']} px @ {settings['fps']} fps")
+        return rewritten
 
     async def watch_video_buffers(self, current, buffers):
         """Advance the RTP loss deadlines off the packet path; request keyframes."""

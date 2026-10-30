@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import re
 import unittest
 
 from aiortc import RTCConfiguration, RTCPeerConnection, RTCRtpSender, VideoStreamTrack
@@ -452,4 +453,86 @@ class DecoderOverloadTests(AioHTTPTestCase):
             decode_module.get_decoder = real_factory
             if socket is not None:
                 await socket.close()
+            await sender.close()
+
+
+class AnswerLevelTests(AioHTTPTestCase):
+    """The answer must declare an H.264 level that covers the receive profile.
+
+    aiortc 1.15.0 advertises level 3.1 (profile-level-id 42001f/42e01f) for every
+    target. At 2560 px / 60 fps that understates the requirement (level 5.1), so a
+    sender that honours the declared level is forced to downscale or fall back.
+    The answer AirFrame sends must declare the level it is configured to receive.
+    """
+
+    async def get_application(self):
+        self.room = Room()
+        self.receiver = Receiver(self.room, lambda frame: None, lambda *args: None,
+                                 lambda *args: None, lambda *args: None)
+        self.room.peers['receiver'] = self.receiver
+        return create_app(self.room)
+
+    async def answer_for(self, settings):
+        self.room.settings = dict(settings)
+        sender = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+        sender.addTrack(VideoStreamTrack())
+        capabilities = [codec for codec in RTCRtpSender.getCapabilities('video').codecs
+                        if codec.mimeType == 'video/H264']
+        self.assertTrue(capabilities)
+        sender.getTransceivers()[0].setCodecPreferences(capabilities)
+        socket = await self.client.ws_connect('/signal')
+        try:
+            await socket.send_json({'role': 'sender', 'credential': self.room.code})
+            self.assertEqual((await socket.receive_json(timeout=3))['type'], 'authenticated')
+            self.assertEqual((await socket.receive_json(timeout=3))['type'], 'peer-ready')
+            await sender.setLocalDescription(await sender.createOffer())
+            await socket.send_json({'type': 'offer', 'session': 'level-test',
+                                    'sdp': sender.localDescription.sdp})
+            answer = await socket.receive_json(timeout=5)
+            self.assertEqual(answer['type'], 'answer')
+            return answer['sdp']
+        finally:
+            await socket.close()
+            await sender.close()
+
+    @staticmethod
+    def levels(sdp):
+        return [int(value[4:6], 16) for value in
+                re.findall(r'profile-level-id=([0-9a-fA-F]{6})', sdp)]
+
+    async def test_base_profile_declares_level_5_1(self):
+        sdp = await self.answer_for({'fps': 60, 'bitrate': 24, 'maxSize': 2560})
+        self.assertEqual(self.levels(sdp), [0x33, 0x33], sdp)
+        self.assertIn('profile-level-id=420033', sdp.lower(), sdp)
+        self.assertIn('profile-level-id=42e033', sdp.lower(), sdp)
+
+    async def test_1080p60_declares_level_4_2(self):
+        sdp = await self.answer_for({'fps': 60, 'bitrate': 16, 'maxSize': 1920})
+        self.assertEqual(self.levels(sdp), [0x2a, 0x2a], sdp)
+
+    async def test_1080p30_declares_level_4_0(self):
+        sdp = await self.answer_for({'fps': 30, 'bitrate': 10, 'maxSize': 1920})
+        self.assertEqual(self.levels(sdp), [0x28, 0x28], sdp)
+
+    async def test_offer_without_h264_keeps_answer_unchanged(self):
+        self.room.settings = dict({'fps': 60, 'bitrate': 16, 'maxSize': 1920})
+        sender = RTCPeerConnection(RTCConfiguration(iceServers=[]))
+        sender.addTrack(VideoStreamTrack())
+        capabilities = [codec for codec in RTCRtpSender.getCapabilities('video').codecs
+                        if codec.mimeType == 'video/VP8']
+        self.assertTrue(capabilities)
+        sender.getTransceivers()[0].setCodecPreferences(capabilities)
+        socket = await self.client.ws_connect('/signal')
+        try:
+            await socket.send_json({'role': 'sender', 'credential': self.room.code})
+            await socket.receive_json(timeout=3)
+            await socket.receive_json(timeout=3)
+            await sender.setLocalDescription(await sender.createOffer())
+            await socket.send_json({'type': 'offer', 'session': 'vp8-test',
+                                    'sdp': sender.localDescription.sdp})
+            answer = await socket.receive_json(timeout=5)
+            self.assertEqual(answer['type'], 'answer')
+            self.assertEqual(self.levels(answer['sdp']), [], answer['sdp'])
+        finally:
+            await socket.close()
             await sender.close()
