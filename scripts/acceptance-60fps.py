@@ -453,7 +453,7 @@ def build_app(args, events, frames, stats_sink):
             port = probe.getsockname()[1]
     server = LocalServer(port, events, frames)
     server.start()
-    server.room.settings = {'fps': args.fps, 'bitrate': args.bitrate,
+    server.room.effective_profile = {'fps': args.fps, 'bitrate': args.bitrate,
                             'maxSize': args.max_size}
     window = Desktop(server)
     window.show()
