@@ -27,6 +27,7 @@ class Receiver:
         self.last_frame_at = 0.0
         self.max_frame_gap = 0.0
         self.playout = Playout(playout_mode)
+        self.playout_issue = None
         self.playout_changed = None
         self.last_output_at = self.output_gap = 0.0
 
@@ -119,6 +120,16 @@ class Receiver:
         except Exception as exc:
             self.on_log(f"Ошибка звука: {exc}")
 
+    def report_playout_issue(self):
+        """Surface an incompatible playout budget once, with the safe suggestion."""
+        issue = self.playout.incompatible
+        if issue is not None and self.playout_issue != issue:
+            self.playout_issue = issue
+            self.on_log(issue['message'])
+            self.on_state("error", issue['message'])
+        elif issue is None:
+            self.playout_issue = None
+
     async def frames(self, current, track):
         self.playout.reset(fps=self.room.settings["fps"])
         changed = self.playout_changed = asyncio.Event()
@@ -136,8 +147,12 @@ class Receiver:
                         self.max_frame_gap = max(self.max_frame_gap, now-self.last_frame_at)
                     self.last_frame_at = now
                     self.frame_count += 1
-                    self.playout.fps = self.room.settings["fps"]
+                    fps = self.room.settings["fps"]
+                    if self.playout.fps != fps:
+                        # A profile change explicitly recreates budget and timeline.
+                        self.playout.reset(fps=fps)
                     self.playout.push(frame, now)
+                    self.report_playout_issue()
                     changed.set()
                     if self.frame_count % 8 == 0:
                         await asyncio.sleep(0)
@@ -253,6 +268,7 @@ class Receiver:
         self.converted_count = self.dropped_count = 0
         self.conversion_ms = self.last_frame_at = self.max_frame_gap = 0.0
         self.playout = Playout(self.playout.mode, self.room.settings["fps"])
+        self.playout_issue = None
         self.last_output_at = self.output_gap = 0.0
         self.on_stats({})
         self.on_frame(None)

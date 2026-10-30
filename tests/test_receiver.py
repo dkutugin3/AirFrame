@@ -160,3 +160,43 @@ class LatestFrameTests(unittest.IsolatedAsyncioTestCase):
         release.set()
         await asyncio.wait_for(close,2)
         self.assertEqual(output,[1,None])
+
+
+class PlayoutBudgetTests(unittest.IsolatedAsyncioTestCase):
+    async def test_incompatible_playout_budget_is_refused_with_60_fps_suggestion(self):
+        import av
+        from fractions import Fraction
+        from aiortc.mediastreams import MediaStreamError
+        room = Room()
+        room.settings = {**room.settings, 'fps': 120, 'bitrate': 24, 'maxSize': 2560}
+        logs, states, delivered = [], [], []
+        receiver = Receiver(room, delivered.append, lambda *args: states.append(args),
+                            lambda *args: None, logs.append)
+        receiver.set_playout('stable')
+        frames = []
+        for index in range(3):
+            frame = av.VideoFrame(1920, 2560, 'yuv420p')
+            frame.pts, frame.time_base = index, Fraction(1, 120)
+            frames.append(frame)
+
+        class Track:
+            index = 0
+            async def recv(self):
+                if Track.index >= len(frames):
+                    raise MediaStreamError
+                frame = frames[Track.index]
+                Track.index += 1
+                return frame
+
+        receiver.peer = DummyPeer()
+        worker = receiver.task(receiver.frames(receiver.peer, Track()))
+        await asyncio.wait_for(worker, 3)
+        try:
+            self.assertIsNotNone(receiver.playout.incompatible)
+            self.assertEqual(receiver.playout.incompatible['suggestionFps'], 60)
+            self.assertTrue(any('60 FPS' in log for log in logs), logs)
+            self.assertTrue(any(state[0] == 'error' for state in states), states)
+            self.assertEqual(delivered, [])
+            self.assertEqual(receiver.playout.metrics()['playoutIncompatible'], True)
+        finally:
+            await receiver.close_peer()
