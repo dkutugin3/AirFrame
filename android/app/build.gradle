@@ -27,6 +27,12 @@ android {
     buildTypes {
         release { minifyEnabled false }
     }
+    testOptions {
+        // The profile-defaulting tests instantiate ProjectionService on the JVM and invoke its
+        // pure private configure()/defaults paths. Framework methods they never reach (main
+        // looper handler setup, etc.) return defaults instead of throwing "not mocked".
+        unitTests.returnDefaultValues = true
+    }
 }
 
 dependencies {
@@ -37,5 +43,7 @@ dependencies {
     // scanner crashes with NoClassDefFoundError right after the QR button is pressed.
     implementation 'androidx.core:core:1.16.0'
     testImplementation 'junit:junit:4.13.2'
+    // Real org.json on the JVM so unit tests can exercise the signalling settings payload.
+    testImplementation 'org.json:json:20240303'
     implementation 'com.squareup.okhttp3:okhttp:4.12.0'
 }

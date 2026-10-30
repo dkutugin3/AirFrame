@@ -52,8 +52,14 @@ public class ProjectionService extends Service {
     private String address, credential;
     private boolean closing=false, remoteSet=false, negotiating=false, restartPending=false;
     private int attempts=0, restarts=0, generation=0;
-    private volatile int fps=30;
-    private int bitrate=10, maxSize=1920, contentWidth=0, contentHeight=0;
+    /**
+     * Base profile for a new session (plan stage 1): 60 FPS / 24 Mbit/s / long side 2560 px.
+     * Shared by the peer-ready path (peer sends no settings) and by configure() fallbacks so the
+     * Android sender and the Python session defaults agree.
+     */
+    static final int DEFAULT_FPS=60, DEFAULT_BITRATE=24, DEFAULT_MAX_SIZE=2560;
+    private volatile int fps=DEFAULT_FPS;
+    private int bitrate=DEFAULT_BITRATE, maxSize=DEFAULT_MAX_SIZE, contentWidth=0, contentHeight=0;
     private String profileRequest="";
     private final List<IceCandidate> pendingIce=new ArrayList<>();
     private Runnable reconnectTask, restartTask, stableTask;
@@ -198,9 +204,17 @@ public class ProjectionService extends Service {
 
     private void configure(JSONObject settings) {
         if(settings==null)return;
-        fps=settings.optInt("fps",120);bitrate=settings.optInt("bitrate",80);maxSize=settings.optInt("maxSize",2560);
+        fps=setting(settings,"fps",DEFAULT_FPS);
+        bitrate=setting(settings,"bitrate",DEFAULT_BITRATE);
+        maxSize=setting(settings,"maxSize",DEFAULT_MAX_SIZE);
         resize(0,0);
         applyEncoding();
+    }
+
+    /** A settings field sent by the peer, or the base-profile default when omitted/invalid. */
+    private static int setting(JSONObject settings,String key,int fallback) {
+        int value=settings.optInt(key,0);
+        return value>0 ? value : fallback;
     }
 
     private int phoneVolume() {
