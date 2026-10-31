@@ -1,5 +1,4 @@
-# RELEASE NOTES — AirFrame 0.5.0 (runtime `a981886`)
-
+# RELEASE NOTES — AirFrame 0.6.0 (runtime `eafe485`)
 Status: **release v0.5.0**. `pyproject.toml` version 0.5.0; the released runtime is
 commit `a981886` (stage-8 adaptive quality) plus docs-only commits; the finish pass
 `60cbcee` (review fixes I3/C1/I2/I6/I13) is part of the runtime. Published artifacts
