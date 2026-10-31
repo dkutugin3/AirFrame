@@ -14,30 +14,6 @@ Android screen mirroring over Wi-Fi into a **standalone desktop app for Windows 
 > [“What is verified and what is not”](#what-is-verified-and-what-is-not)). Hardware decoding is
 > verified on macOS only and gives no wall-time win on the pinned stack; HEVC is not implemented.
 
-### Branch status
-
-Implemented and covered by tests (details and raw logs in
-`artifacts/2026-10-30-stable60fps/` and `.superpowers/sdd/stable-60fps-tdd/reports/`):
-
-- **Single new-session profile:** 60 FPS / 2560 px long side / 24 Mbit/s max / OBS-stable playout. The 60/16/1920 and 30 FPS presets remain for weaker machines; experimental 120 FPS stays an opt-in, never a default. The UI is built from the session settings; pressing “Apply” without edits sends the same profile.
-- **Honest profile acknowledgement:** “saved”, “applied”, “rejected”, “timeout” are distinct states; a rejection is never shown as applied, and an acknowledged `setParameters()` means the settings were accepted — not proven 60 FPS.
-- **Playout buffer:** “OBS-stable” (250–350 ms reserve), “balanced” (120–200 ms) and “minimal latency” (no reserve) modes. Capacity `ceil(max_delay × fps) + 3` frames (24 at 60 FPS, 45 at the experimental 120 FPS), a byte budget computed from real decoded planes, and a hard limit of **256 MiB for the playout queue only**; a combination that does not fit is rejected explicitly with a safe 60 FPS suggestion. A accumulated backlog is never played back sped-up.
-- **Bounded wait for lost RTP packets:** a gap is proven only when the next packet arrives; waiting is capped at **150 ms** (previously a loss could wait ~3.4 s until buffer overflow). A key frame is then requested: first PLI immediately, retries at most every 500 ms until recovery. A lossless 225 ms pause causes no false recovery; packets from a departed epoch are ignored.
-- **Decoder queues:** count/memory/age-bounded queues before and after the decoder, controlled IDR-based recovery under load, old-epoch frames dropped before playout/Qt, observable depth/age/decode-time/skip-reason metrics.
-- **Rendering (stage 6):** YUV frames go to `QVideoWidget`/`QVideoSink` through **QRhi** (Metal on macOS, `yuv_triplanar` shader); the mandatory per-frame `reformat("bgra")` is gone from the main path. One **YUV copy per frame** remains (PySide6 6.12 cannot wrap external PyAV memory) — this is **not zero-copy**. An honest software fallback with a visible reason exists. The `AirFrame — OBS` window defaults to an **exact 1:1 physical-pixel size**: a 2560×1440 stream → 1280×720 logical window = 2560×1440 physical, no hidden downscale. Hidden/closed windows do no per-frame work; both windows share one decoded stream. Details: `docs/RENDERING.md`.
-- **Hardware H.264 decoding (stage 7, macOS only, opt-in):** VideoToolbox really engages (`is_hwaccel`, `videotoolbox_vld`), frames/PTS/sizes match the software decoder. Measured on the shared bench: **≈3.1 ms/frame wall vs ≈0.3 ms/frame for software** (CPU 0.55 vs 1.2 ms/frame) — no time win, only CPU offload. Therefore `auto` keeps the verified software path and `AIRFRAME_HW_DECODE=hardware` is an explicit opt-in. Failure → software fallback with an IDR restart, a visible reason and no retry loop. This is **not zero-copy**. Windows/D3D11VA was not verified.
-- **H.264 High (stage 9a, desktop):** a process-local receive-capability window for High/Constrained-High exists only around `setRemoteDescription`; Baseline remains the fallback profile and the answer carries the correct level (`640c33`/`640033` at 2560@60). A real libx264-High stream decodes end-to-end. Android High end-to-end was not verified without a phone. **HEVC/H.265 is not implemented and not claimed.**
-- **Telemetry and diagnostics:** the phone can report capture/pacer/encoder FPS, frame counters, the actual video bitrate, mean encode time over a window, codec/profile, sizes and thermal status. A missing field reads as “unknown”, `0` is a measured zero; a windowed mean encode time is never passed off as a per-frame p95; diagnostics distinguish “capture did not deliver 60”, “encoder cannot keep up” and “transport/PC cannot keep up”. The new fields flow from the phone through `receiver.py` into diagnostics.
-- **Phone audio (v0.5.0+):** the audio played on the phone (Android 10+) is captured, AAC-encoded and carried over the WebRTC data channel to the computer, where it plays on the default output — OBS picks it up as desktop audio. A checkbox toggles capture; the phone's media volume is adjustable from the computer with two-way synchronisation.
-- **Android:** the base profile is fixed, `FramePacer` is fixed (timestamp reset, post-pause bursts), a measuring telemetry module and JUnit tests were added. APK/lint/unit tests build in Docker.
-- **Separate native Qt tests (`tests_native/`)** — profile, acknowledgements, diagnostics, render/decoder contracts; the offscreen suite runs as its own command, the Docker suite stays PySide6-free.
-- **Measurement bench and acceptance harness:** a reproducible H.264 source with machine-readable IDs and interval metrics (`docs/MEASUREMENT.md`), §13.B/§13.C drivers with fail-closed external recording (`docs/ACCEPTANCE.md`).
-
-**Not covered by this run's verification:** the physical 10-minute §13.B run and the §13.C comparison
-for the new path (the display was occupied by the user's fullscreen app; the harness correctly
-refused to record the wrong window), a real phone §13.D, H.264 High on Android, Windows, HEVC,
-zero-copy, and a wall-time win from hardware decoding.
-
 ### Profile and acknowledgement
 
 - Settings are split into “Connection”, “Video” and “Sound & OBS” tabs. In a small window the pages scroll vertically; closed dropdowns and sliders do not change values from the mouse wheel. Detailed statistics live in the “Diagnostics and help” window.
@@ -302,30 +278,6 @@ External docs: [MediaProjection](https://developer.android.com/media/grow/media-
 > [«Финальная приёмка этого прогона»](#финальная-приёмка-этого-прогона) и
 > [«Что проверено и что нет»](#что-проверено-и-что-нет)). Аппаратное декодирование проверено только
 > на macOS и не даёт выигрыша по времени на закреплённых версиях; HEVC не реализован.
-
-### Состояние ветки
-
-Реализовано и покрыто тестами (детали и сырые логи — в
-`artifacts/2026-10-30-stable60fps/` и `.superpowers/sdd/stable-60fps-tdd/reports/`):
-
-- **Единый профиль нового сеанса:** 60 FPS / 2560 px по длинной стороне / максимум 24 Мбит/с / режим стабильности OBS. Пресет 60/16/1920 и 30 FPS остались для слабых машин, экспериментальный 120 FPS остался выбором, но не по умолчанию. UI создаётся из настроек сеанса; «Применить» без правок отправляет тот же профиль.
-- **Честное подтверждение профиля:** «Сохранено», «подтверждено», «отклонено», «таймаут» — разные состояния; отказ никогда не показывается как применение, а подтверждение `setParameters()` означает принятие настроек, а не доказанные 60 FPS.
-- **Playout-буфер:** режимы «стабильность OBS» (запас 250–350 мс), «баланс» (120–200 мс), «минимальная задержка» (без запаса). Ёмкость `ceil(max_delay × fps) + 3` кадров (24 на 60 FPS, 45 на экспериментальном 120 FPS), бюджет памяти по реальным декодированным плоскостям, жёсткий предел **256 МиБ только для очереди playout**; непомещающаяся комбинация отклоняется явно с безопасным предложением 60 FPS. Накопленная очередь не проигрывается ускоренно.
-- **Ограниченное ожидание потерянных RTP-пакетов:** разрыв считается доказанным только после прихода следующего пакета; ожидание ограничено **150 мс** (раньше потеря могла ждать ~3,4 с до переполнения буфера). Затем запрос ключевого кадра: первый PLI сразу, повторы не чаще раза в 500 мс, до восстановления. Безпотерьная пауза 225 мс не вызывает ложного восстановления; пакеты старой эпохи игнорируются.
-- **Очереди декодера:** до и после декодера — ограниченные по количеству/памяти/возрасту очереди, контролируемое восстановление по IDR при перегрузке, отбрасывание кадров старой эпохи до playout/Qt, видимые метрики глубины/возраста/декодирования/причин пропусков.
-- **Рендеринг (этап 6):** YUV-кадры идут в `QVideoWidget`/`QVideoSink` через **QRhi** (на macOS — Metal, шейдер `yuv_triplanar`); обязательное покадровое `reformat("bgra")` убрано из основного пути. Остаётся **один YUV-copy на кадр** (PySide6 6.12 не умеет оборачивать внешнюю память PyAV) — это **не zero-copy**. Есть честный software-fallback с видимой причиной. Окно `AirFrame — OBS` по умолчанию имеет **точный размер 1:1 по физическим пикселям**: поток 2560×1440 → окно 1280×720 логических = 2560×1440 физических, без скрытого downscale. Скрытые/закрытые окна не работают покадрово; оба окна используют один поток декодированных кадров. Подробности: `docs/RENDERING.md`.
-- **Аппаратное декодирование H.264 (этап 7, только macOS, opt-in):** VideoToolbox действительно включается (`is_hwaccel`, `videotoolbox_vld`), кадры/PTS/размеры идентичны программному декодеру. Измерено на общем стенде: **≈3,1 мс/кадр wall против ≈0,3 мс/кадр у software** (CPU 0,55 против 1,2 мс/кадр) — выигрыша по времени нет, только разгрузка CPU. Поэтому `auto` оставляет проверенный software, а `AIRFRAME_HW_DECODE=hardware` — явный opt-in. Отказ/сбой → software-fallback с IDR-перезапуском, видимой причиной и без цикла повторов. Это **не zero-copy**. Windows/D3D11VA не проверялся.
-- **H.264 High (этап 9a, desktop):** процессно-локальное расширение приёма High/Constrained-High только на время `setRemoteDescription`; Baseline остаётся запасным профилем, answer получает корректный уровень (`640c33`/`640033` на 2560@60). Реальный libx264-High поток декодируется end-to-end. Android High end-to-end без телефона не проверен. **HEVC/H.265 не реализован и не заявлен.**
-- **Телеметрия и диагностика:** телефон может присылать FPS захвата/pacer/кодировщика, счётчики кадров, фактический видеобитрейт, среднее время кодирования за окно, кодек/профиль, размеры, температурный статус. Отсутствие — `неизвестно`, 0 — измеренный ноль; среднее кодирование не выдаётся за p95 одного кадра; диагностика различает «захват не дал 60 FPS», «кодировщик не успевает» и «транспорт/ПК не успевают». Новые поля проходят от телефона через `receiver.py` до диагностики.
-- **Звук телефона (v0.5.0+):** воспроизводимый звук телефона (Android 10+) захватывается, кодируется в AAC и идёт через WebRTC data channel на компьютер, где воспроизводится на устройстве по умолчанию — OBS захватывает его как звук рабочего стола. Чекбокс включает/выключает захват; громкость мультимедиа телефона регулируется с компьютера с двусторонней синхронизацией.
-- **Android:** базовый профиль исправлен, `FramePacer` исправлен (сброс временной шкалы, пачки после паузы), добавлены измеряющий telemetry-модуль и JUnit-тесты. APK/lint/unit-тесты собираются в Docker.
-- **Отдельные нативные Qt-тесты (`tests_native/`)** — профиль, подтверждения, диагностика, контракты рендера/декодера; offscreen-набор отдельной командой, Docker-набор остаётся без PySide6.
-- **Измерительный стенд и приёмочный harness:** воспроизводимый H.264-источник с машиночитаемыми ID и метриками интервалов (`docs/MEASUREMENT.md`), драйверы §13.B/§13.C с fail-closed внешней записью (`docs/ACCEPTANCE.md`).
-
-**Не входит в проверенный объём этого прогона:** физический 10-минутный прогон §13.B и §13.C нового
-пути (дисплей был занят полноэкранным приложением пользователя, harness корректно отказался писать не
-то окно), реальный телефон §13.D, H.264 High на Android, Windows, HEVC, zero-copy, выигрыш от
-аппаратного декодирования.
 
 ### Профиль и подтверждение
 
