@@ -12,6 +12,7 @@ from .codec_capabilities import CapabilityError, h264_high_receive_capabilities
 from .decode import install_decoder_pipelines
 from .hwdecode import select_decoder_factory
 from .h264 import advertise_answer_level, level_name, rewrite_profile_level_id
+from .h265 import install_h265
 from .transport import VIDEO_LOSS_DEADLINE, install_video_buffers
 from .playout import Playout
 from .server import TELEMETRY_FLOAT_BOUNDS, TELEMETRY_INT_BOUNDS, TELEMETRY_TEXT_LIMITS
@@ -32,6 +33,8 @@ class Receiver:
         self.room = room
         self.on_frame, self.on_state, self.on_stats, self.on_log = on_frame, on_state, on_stats, on_log
         self.on_audio = on_audio
+        # RFC 7798 receive support for the pinned aiortc (idempotent, guarded).
+        install_h265()
         self.peer = None
         self.session = ""
         self.tasks = set()

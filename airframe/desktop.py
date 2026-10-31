@@ -598,6 +598,12 @@ class Desktop(QMainWindow):
         self.rate = WheelSafeSlider(Qt.Orientation.Horizontal)
         self.rate.setRange(4,80)
         ql.addWidget(self.rate)
+        self.hevc = QCheckBox("Предпочесть HEVC/H.265")
+        self.hevc.setChecked(bool(self.server.room.saved_profile.get("preferHevc", False)))
+        self.hevc.toggled.connect(self.custom_profile)
+        ql.addWidget(self.hevc)
+        ql.addWidget(text("Лучше качество при том же битрейте; H.264 остаётся запасным кодеком.",
+                          "muted", True))
         self.apply_button = apply = QPushButton("Применить профиль")
         apply.setObjectName("primary")
         apply.clicked.connect(self.apply_profile)
@@ -795,6 +801,9 @@ class Desktop(QMainWindow):
         self.target_fps.setCurrentIndex(self.target_fps.findData(settings["fps"]))
         self.max_size.setCurrentIndex(self.max_size.findData(settings["maxSize"]))
         self.rate.setValue(settings["bitrate"])
+        self.hevc.blockSignals(True)
+        self.hevc.setChecked(bool(settings.get("preferHevc", False)))
+        self.hevc.blockSignals(False)
         for field in (self.target_fps,self.max_size,self.rate):
             field.blockSignals(False)
         name = next((name for name, profile in PRESETS.items() if profile == settings), "Свой профиль")
@@ -867,7 +876,8 @@ class Desktop(QMainWindow):
     def apply_profile(self):
         settings = video_settings({"fps":self.target_fps.currentData(),
                                    "maxSize":self.max_size.currentData(),
-                                   "bitrate":self.rate.value()})
+                                   "bitrate":self.rate.value(),
+                                   "preferHevc":self.hevc.isChecked()})
         self.adaptive.manual_override(video_settings(settings))
         self.pending_profile = secrets.token_hex(8)
         self.profile_ack_state = ACK_PENDING

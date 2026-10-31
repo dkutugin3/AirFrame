@@ -280,6 +280,13 @@ def video_settings(value):
             or type(result["bitrate"]) is not int or not 4 <= result["bitrate"] <= 80
             or type(result["maxSize"]) is not int or result["maxSize"] not in (1280, 1920, 2560)):
         raise ValueError("Invalid video settings")
+    # Optional codec preference: HEVC is negotiated first when the phone
+    # supports it; H.264 stays the fallback and the implicit default.
+    prefer = value.get("preferHevc", False)
+    if type(prefer) is not bool:
+        raise ValueError("Invalid video settings")
+    if prefer:
+        result["preferHevc"] = True
     return result
 
 

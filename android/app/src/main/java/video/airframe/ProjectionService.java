@@ -71,6 +71,7 @@ public class ProjectionService extends Service {
      */
     static final int DEFAULT_FPS=60, DEFAULT_BITRATE=24, DEFAULT_MAX_SIZE=2560;
     private volatile int fps=DEFAULT_FPS;
+    private volatile boolean preferHevc=false;
     private int bitrate=DEFAULT_BITRATE, maxSize=DEFAULT_MAX_SIZE, contentWidth=0, contentHeight=0;
     private String profileRequest="";
     private final List<IceCandidate> pendingIce=new ArrayList<>();
@@ -301,8 +302,24 @@ public class ProjectionService extends Service {
         fps=setting(settings,"fps",DEFAULT_FPS);
         bitrate=setting(settings,"bitrate",DEFAULT_BITRATE);
         maxSize=setting(settings,"maxSize",DEFAULT_MAX_SIZE);
+        boolean hevc=settings.optBoolean("preferHevc",false);
+        boolean codecChanged=hevc!=preferHevc;
+        preferHevc=hevc;
         resize(0,0);
         applyEncoding();
+        // A codec preference change needs a fresh offer to take effect; the
+        // negotiated fallback stays H.264 when HEVC is not accepted.
+        if(codecChanged && peer!=null && remoteSet)scheduleRestart();
+    }
+
+    /** Pure ordering for unit tests: preferred codec first, H.264 next, rest unchanged. */
+    static void sortCodecPreferences(List<RtpCapabilities.CodecCapability> codecs, boolean hevcFirst) {
+        String preferred=hevcFirst ? "H265" : "H264";
+        codecs.sort((a,b)->{
+            int rankA=a.name.equalsIgnoreCase(preferred)?0:(a.name.equalsIgnoreCase("H264")?1:2);
+            int rankB=b.name.equalsIgnoreCase(preferred)?0:(b.name.equalsIgnoreCase("H264")?1:2);
+            return Integer.compare(rankA,rankB);
+        });
     }
 
     /** A settings field sent by the peer, or the base-profile default when omitted/invalid. */
@@ -455,9 +472,10 @@ public class ProjectionService extends Service {
                 else stopAudio();
             });}
         });
-        // Prefer hardware H.264; keep VP8/VP9 as negotiated fallbacks.
+        // Prefer hardware H.264, or HEVC when the profile asks for it;
+        // the rest stay as negotiated fallbacks.
         List<RtpCapabilities.CodecCapability> codecs=new ArrayList<>(factory.getRtpSenderCapabilities(MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO).codecs);
-        codecs.sort((a,b)->Boolean.compare(!a.name.equalsIgnoreCase("H264"),!b.name.equalsIgnoreCase("H264")));
+        sortCodecPreferences(codecs,preferHevc);
         for(RtpTransceiver transceiver:peer.getTransceivers())
             if(transceiver.getMediaType()==MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO)
                 transceiver.setCodecPreferences(codecs);
