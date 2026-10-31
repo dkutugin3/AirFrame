@@ -367,7 +367,8 @@ public class ProjectionService extends Service {
         applied=applied && budget;
         status=applied ? "Профиль применён · "+fps+" fps · до "+maxSize+" px" : "Кодировщик отклонил профиль";
         send(json("type","configured","requestId",profileRequest,"applied",applied,
-                "settings",json("fps",fps,"bitrate",bitrate,"maxSize",maxSize)));
+                "settings",json("fps",fps,"bitrate",bitrate,"maxSize",maxSize,
+                        "preferHevc",preferHevc)));
     }
 
     private void connect() {

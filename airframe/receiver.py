@@ -121,6 +121,13 @@ class Receiver:
             with self.high_profile_negotiation():
                 await current.setRemoteDescription(
                     RTCSessionDescription(sdp=message["sdp"], type="offer"))
+            # Honest negotiation evidence: what the phone offered and what we agreed to.
+            offered_names = []
+            for line in message["sdp"].splitlines():
+                if line.startswith("a=rtpmap:") and " H26" in line.upper():
+                    offered_names.append(line.split()[1].split("/")[0])
+            if offered_names:
+                self.on_log("Кодеки телефона в оффере: " + ", ".join(offered_names))
             self.video_buffers = install_video_buffers(current)
             # Stage 7: auto = verified software on this pinned stack (see hwdecode).
             self.decoder_factory = select_decoder_factory(getattr(self.room, "decoder_mode", None))
@@ -133,6 +140,11 @@ class Receiver:
                         f"{VIDEO_LOSS_DEADLINE*1000:.0f} мс, без дополнительной задержки вывода")
             await current.setLocalDescription(await current.createAnswer())
             answer = self.declared_answer(current.localDescription.sdp)
+            agreed = [l.split()[1].split("/")[0] + " (" + l.split(":")[1].split()[0] + ")"
+                      for l in answer.splitlines()
+                      if l.startswith("a=rtpmap:") and (" H26" in l.upper())]
+            if agreed:
+                self.on_log("Согласовано в answer: " + ", ".join(agreed))
             await self.room.send("sender", {"type": "answer", "session": self.session, "sdp": answer})
             self.task(self.statistics(current))
         except Exception as exc:

@@ -988,7 +988,11 @@ class Desktop(QMainWindow):
                                 f" · сборка: {stats.get('assembledFps',0):.0f} fps, пауза {stats.get('assemblyGapMs',0):.0f} мс"
                                 f" · кадр до {stats.get('largestFrameKiB',0):.0f} КиБ"
                                 f" · восстановлений буфера: {stats.get('bufferRecoveries',0)}")
+        codec_detail = (f" · кодек: {stats['codec']}" +
+                        (f" ({stats['codecProfile']})" if stats.get("codecProfile") else "")
+                        if "codec" in stats else "")
         sender_detail = (f" · кодировщик: {stats['encodedFps']:.0f} fps, {stats['width']} × {stats['height']}"
+                         f"{codec_detail}"
                          f" · ограничение: {stats['limitation']}" if "encodedFps" in stats else "")
         telemetry_detail = ""
         if stats:
