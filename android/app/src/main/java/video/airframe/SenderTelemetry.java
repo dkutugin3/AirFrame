@@ -192,6 +192,17 @@ final class SenderTelemetry {
         return out;
     }
 
+    /**
+     * Telemetry cadence: 1 s while the session is young (negotiation plus the first adaptive
+     * decisions), 2 s once stable - getStats walks the whole stats tree and allocates, so a
+     * settled stream does not need it every second.
+     *
+     * @param fastRemainingMs milliseconds left in the fast window; negative once it has passed
+     */
+    static long telemetryDelayMs(long fastRemainingMs){
+        return fastRemainingMs>0 ? 1000L : 2000L;
+    }
+
     /** PowerManager thermal constants (API 29+) mapped to wire strings; unknown stays "unknown". */
     static String thermalStatusName(int status){
         switch(status){

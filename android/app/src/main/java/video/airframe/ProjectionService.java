@@ -73,6 +73,11 @@ public class ProjectionService extends Service {
     private volatile int fps=DEFAULT_FPS;
     private volatile boolean preferHevc=false;
     private int bitrate=DEFAULT_BITRATE, maxSize=DEFAULT_MAX_SIZE, contentWidth=0, contentHeight=0;
+    private final CaptureGate captureGate=new CaptureGate();
+    private boolean captureRunning=false;
+    /** Telemetry keeps its 1 s cadence for this long after each (re)connect, then drops to 2 s. */
+    private static final long TELEMETRY_FAST_MS=30000;
+    private volatile long telemetryFastUntil=0;
     private String profileRequest="";
     private final List<IceCandidate> pendingIce=new ArrayList<>();
     private Runnable reconnectTask, restartTask, stableTask;
@@ -105,7 +110,8 @@ public class ProjectionService extends Service {
                 }
                 send(message);
             }));
-            if(!closing)main.postDelayed(this,1000);
+            if(!closing)main.postDelayed(this,
+                    SenderTelemetry.telemetryDelayMs(telemetryFastUntil-SystemClock.elapsedRealtime()));
         }
     };
     private final Runnable renewWake=new Runnable(){
@@ -146,7 +152,8 @@ public class ProjectionService extends Service {
             wake=pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK,"airframe:stream");
             wake.setReferenceCounted(false);renewWake.run();
             WifiManager wm=(WifiManager)getApplicationContext().getSystemService(WIFI_SERVICE);
-            wifi=wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF,"airframe:wifi");wifi.acquire();
+            wifi=wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF,"airframe:wifi");
+            wifi.setReferenceCounted(false); // acquired/released together with the live capture
             audio=(AudioManager)getSystemService(AUDIO_SERVICE);
             PeerConnectionFactory.initialize(PeerConnectionFactory.InitializationOptions.builder(this).createInitializationOptions());
             egl=EglBase.create();
@@ -172,9 +179,8 @@ public class ProjectionService extends Service {
                     downstream.onFrameCaptured(frame);
                 }
             });
-            int[] size=captureSize(0,0);capturer.startCapture(size[0],size[1],fps);
-            source.adaptOutputFormat(size[0],size[1],fps);
-            telemetry.setCaptureFormat(size[0],size[1]);
+            // Capture starts lazily in offer(): until a peer session is live it would only
+            // burn GPU on a service that is waiting for a receiver (see CaptureGate).
             track=factory.createVideoTrack("airframe-screen",source);
             http=new OkHttpClient.Builder().pingInterval(15,TimeUnit.SECONDS).connectTimeout(10,TimeUnit.SECONDS).readTimeout(0,TimeUnit.SECONDS).build();
             connect();
@@ -213,7 +219,7 @@ public class ProjectionService extends Service {
                             .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                             .setSampleRate(48000)
                             .setChannelMask(AudioFormat.CHANNEL_IN_STEREO).build())
-                    .setBufferSizeInBytes(8192)
+                    .setBufferSizeInBytes(16384)
                     .setAudioPlaybackCaptureConfig(new AudioPlaybackCaptureConfiguration.Builder(projection)
                             .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
                             .addMatchingUsage(AudioAttributes.USAGE_GAME)
@@ -242,21 +248,16 @@ public class ProjectionService extends Service {
 
     /** Capture thread: owns the record and the codec; releases them on exit. */
     private void captureAudioLoop() {
-        ByteBuffer pcm=ByteBuffer.allocateDirect(8192);
+        // 8192-byte reads halve the thread wake-ups of the previous 4096 (~47 -> ~23 per second).
+        ByteBuffer pcm=ByteBuffer.allocateDirect(16384);
         MediaCodec.BufferInfo info=new MediaCodec.BufferInfo();
         long pts=0;
         try{
             while(audioRunning && audioChannel!=null && audioChannel.state()==DataChannel.State.OPEN){
                 if(!audioEnabled){Thread.sleep(50);continue;}
-                int read=audioCapture.read(pcm,4096);
+                int read=audioCapture.read(pcm,8192);
                 if(read<=0)continue;
-                int input=audioEncoder.dequeueInputBuffer(10000);
-                if(input>=0){
-                    ByteBuffer in=audioEncoder.getInputBuffer(input);
-                    in.clear();pcm.position(0);pcm.limit(read);in.put(pcm);
-                    audioEncoder.queueInputBuffer(input,0,read,pts,0);
-                    pts+=read*1000000L/(48000*4);
-                }
+                pts=feedEncoder(pcm,read,pts);
                 int output;
                 while(audioRunning && (output=audioEncoder.dequeueOutputBuffer(info,0))>=0){
                     ByteBuffer encoded=audioEncoder.getOutputBuffer(output);
@@ -278,6 +279,28 @@ public class ProjectionService extends Service {
         }
     }
 
+    /** Queue one PCM read, splitting it across codec input buffers when they are smaller than
+     *  the read; the AAC encoder assembles frames from the continuous stream, so pts advances
+     *  by the bytes actually queued. */
+    private long feedEncoder(ByteBuffer pcm,int length,long pts) {
+        pcm.position(0);pcm.limit(length);
+        while(pcm.remaining()>0 && audioRunning){
+            int input=audioEncoder.dequeueInputBuffer(10000);
+            if(input<0)return pts; // no buffer within 10 ms: drop this read, like the old path
+            ByteBuffer in=audioEncoder.getInputBuffer(input);
+            in.clear();
+            int chunk=Math.min(pcm.remaining(),in.remaining());
+            if(chunk<=0)return pts; // zero-capacity buffer: drop the read instead of spinning
+            int limit=pcm.limit();
+            pcm.limit(pcm.position()+chunk);
+            in.put(pcm);
+            pcm.limit(limit);
+            audioEncoder.queueInputBuffer(input,0,chunk,pts,0);
+            pts+=chunk*1000000L/(48000*4);
+        }
+        return pts;
+    }
+
     private int[] captureSize(int width,int height) {
         if(width<=0 || height<=0) {
             WindowManager wm=(WindowManager)getSystemService(WINDOW_SERVICE);
@@ -288,13 +311,34 @@ public class ProjectionService extends Service {
         return new int[]{Math.max(2,((int)(width*scale)/2)*2),Math.max(2,((int)(height*scale)/2)*2)};
     }
 
+    /** Start or stop the hardware capture so it follows the CaptureGate; WifiLock rides along. */
+    private void syncCaptureToGate() {
+        if(closing || capturer==null)return;
+        boolean want=captureGate.shouldCapture();
+        if(want && !captureRunning){
+            int[] size=captureSize(contentWidth,contentHeight);
+            capturer.startCapture(size[0],size[1],fps);
+            source.adaptOutputFormat(size[0],size[1],fps);
+            telemetry.setCaptureFormat(size[0],size[1]);
+            captureRunning=true;
+        }else if(!want && captureRunning){
+            try{capturer.stopCapture();}catch(Exception ignored){}
+            captureRunning=false;
+        }
+        if(wifi==null)return;
+        if(want && !wifi.isHeld())wifi.acquire();
+        if(!want && wifi.isHeld())wifi.release();
+    }
+
     private void resize(int width,int height) {
         if(closing || capturer==null)return;
         if(width>0 && height>0){contentWidth=width;contentHeight=height;}
         int[] size=captureSize(contentWidth,contentHeight);
-        capturer.changeCaptureFormat(size[0],size[1],fps);
+        // changeCaptureFormat targets a running capture; the lazy start in offer() picks the
+        // fresh size up itself (configure() there runs before it).
+        if(captureRunning)capturer.changeCaptureFormat(size[0],size[1],fps);
         source.adaptOutputFormat(size[0],size[1],fps);
-        telemetry.setCaptureFormat(size[0],size[1]);
+        if(captureRunning)telemetry.setCaptureFormat(size[0],size[1]);
     }
 
     private void configure(JSONObject settings) {
@@ -386,6 +430,7 @@ public class ProjectionService extends Service {
     private void lost(WebSocket ws) {
         if(closing || ws!=socket)return;
         socket=null;closePeer();
+        captureGate.onSocketLost();syncCaptureToGate(); // nothing streams during the backoff
         if(attempts>=8){status="Компьютер недоступен. Начните новый сеанс.";stopSelf();return;}
         long delay=Math.min(1000L << attempts++,15000L);
         status="Восстановление связи "+attempts+"/8…";
@@ -420,7 +465,8 @@ public class ProjectionService extends Service {
                 audioEnabled=message.optBoolean("enabled");
                 if(audioEnabled)startAudio();else stopAudio();
                 break;
-            case "peer-left":closePeer();status="Окно приёмника закрыто. Ожидание…";break;
+            case "peer-left":closePeer();captureGate.onPeerLeft();syncCaptureToGate();
+                status="Окно приёмника закрыто. Ожидание…";break;
             case "stop":status="Трансляция завершена с компьютера";stopSelf();break;
             case "error":status=message.optString("message","Ошибка подключения");stopSelf();break;
         }
@@ -450,6 +496,7 @@ public class ProjectionService extends Service {
                 if(epoch!=generation || closing)return;
                 if(state==PeerConnection.PeerConnectionState.CONNECTED){
                     status="В эфире · до "+fps+" fps";
+                    telemetryFastUntil=SystemClock.elapsedRealtime()+TELEMETRY_FAST_MS;
                     if(restartTask!=null)main.removeCallbacks(restartTask);
                     restartPending=false;
                     if(stableTask!=null)main.removeCallbacks(stableTask);
@@ -481,6 +528,8 @@ public class ProjectionService extends Service {
             if(transceiver.getMediaType()==MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO)
                 transceiver.setCodecPreferences(codecs);
         configure(json("fps",fps,"bitrate",bitrate,"maxSize",maxSize));
+        telemetryFastUntil=SystemClock.elapsedRealtime()+TELEMETRY_FAST_MS;
+        captureGate.onOffer();syncCaptureToGate(); // frames flow only from the first offer on
         final PeerConnection current=peer;
         current.createOffer(new Sdp(){@Override public void onCreateSuccess(SessionDescription sdp){main.post(()->{
             if(peer!=current || closing)return;

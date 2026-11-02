@@ -223,6 +223,14 @@ public class SenderTelemetryTest {
         return map;
     }
 
+    /** Telemetry keeps the 1 s cadence only while the session is young, then halves the rate. */
+    @Test public void telemetrySlowsDownOnceTheSessionIsStable(){
+        assertEquals(1000L,SenderTelemetry.telemetryDelayMs(1));
+        assertEquals(1000L,SenderTelemetry.telemetryDelayMs(29999));
+        assertEquals(2000L,SenderTelemetry.telemetryDelayMs(0));
+        assertEquals(2000L,SenderTelemetry.telemetryDelayMs(-1));
+    }
+
     private static Map<String,Object> h264(){
         return codec("video/H264","packetization-mode=1;profile-level-id=42e01f;level-asymmetry-allowed=1");
     }

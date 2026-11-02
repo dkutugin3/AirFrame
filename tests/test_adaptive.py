@@ -108,6 +108,31 @@ class AdaptiveQualityTests(unittest.TestCase):
         self.assertEqual(self.configured(actions), [])
         self.assertTrue(any(a["action"] == "notice" for a in actions))
 
+    def test_two_second_telemetry_keeps_wall_clock_thresholds(self):
+        # The sender reports every 2 s once stable; 3 limited seconds still allow
+        # exactly one step, reached on the second sample (4 accumulated seconds).
+        self.assertIsNone(self.controller.observe(limited="cpu", encoded_fps=41.0, now=2.0))
+        action = self.controller.observe(limited="cpu", encoded_fps=41.0, now=4.0)
+        self.assertEqual(action["action"], "configure")
+        self.assertEqual(action["settings"], FLOOR_PROFILE)
+
+    def test_notice_crosses_the_threshold_exactly_once_with_irregular_steps(self):
+        controller = AdaptiveQuality(base=dict(FLOOR_PROFILE), floor=1920)
+        notices = []
+        for now in (1.5, 3.0, 4.5, 6.0):  # crossing happens on the second sample
+            action = controller.observe(limited="cpu", encoded_fps=30.0, now=now)
+            if action is not None and action["action"] == "notice":
+                notices.append(action)
+        self.assertEqual(len(notices), 1)
+
+    def test_a_telemetry_gap_does_not_fast_forward_the_streaks(self):
+        self.tick(2, limited=False)  # 2 clean seconds
+        # 60 silent seconds, then one clean sample: one sample after a gap must not
+        # alone carry the recovery clock past 15 seconds.
+        action = self.controller.observe(limited="none", encoded_fps=60.0,
+                                        now=self.controller.clock + 60.0)
+        self.assertIsNone(action)
+
 
 if __name__ == "__main__":
     unittest.main()

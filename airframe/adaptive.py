@@ -12,6 +12,10 @@ Contract (docs/IMPLEMENTATION_PLAN_TDD.md §11):
   floor, at most one change per MIN_CHANGE_INTERVAL seconds; restoring the
   chosen size needs RECOVERY_STREAK consecutive clean seconds.
 
+Streaks accumulate wall-clock seconds from the sample timestamps, not sample
+counts: the sender's telemetry cadence (1 s while a session is young, 2 s once
+stable) must not change how fast the controller reacts.
+
 The thresholds are the plan's initial verification values; final values must
 be chosen from target-phone reports and recorded before the comparison run.
 """
@@ -20,6 +24,7 @@ LIMIT_STREAK = 3          # consecutive limited seconds before one downgrade
 RECOVERY_STREAK = 15      # consecutive clean seconds before restoring quality
 MIN_CHANGE_INTERVAL = 10.0  # seconds between any two proposals
 LADDER = (2560, 1920)     # the only controlled reduction step of the long side
+MAX_STEP = 5.0            # seconds credited for one sample; a telemetry gap is not evidence
 
 
 class AdaptiveQuality:
@@ -36,8 +41,8 @@ class AdaptiveQuality:
         self.base = dict(base)
         self._current = dict(base)
         self.clock = 0.0
-        self._limited_run = 0
-        self._clean_run = 0
+        self._limited_seconds = 0.0
+        self._clean_seconds = 0.0
         self._last_change_at = None
         self._manual = False
 
@@ -54,7 +59,7 @@ class AdaptiveQuality:
         self._manual = False
         self.base = dict(base)
         self._current = dict(base)
-        self._limited_run = self._clean_run = 0
+        self._limited_seconds = self._clean_seconds = 0.0
         self._last_change_at = None
 
     def _next_step_down(self):
@@ -67,25 +72,29 @@ class AdaptiveQuality:
         """One telemetry sample. Returns a proposal dict or None.
 
         ``limited`` is the sender's quality-limitation reason ("none" when the
-        encoder keeps up); ``encoded_fps`` is the actual encoded frame rate.
+        encoder keeps up); ``encoded_fps`` is the actual encoded frame rate;
+        ``now`` is monotonic seconds. Streaks are the wall-clock duration of the
+        run, so a slower telemetry cadence does not slow the controller down.
         """
-        step = max(0.0, now - self.clock)
+        step = min(max(0.0, now - self.clock), MAX_STEP)
         self.clock = now
         if self._manual or step <= 0.0 and now != 0.0:
             return None
         limited = limited != "none"
         if limited:
-            self._limited_run += 1
-            self._clean_run = 0
+            self._limited_seconds += step
+            self._clean_seconds = 0.0
         else:
-            self._clean_run += 1
-            self._limited_run = 0
-        if limited and self._limited_run >= self.limit_streak:
+            self._clean_seconds += step
+            self._limited_seconds = 0.0
+        if limited and self._limited_seconds >= self.limit_streak:
             smaller = None if self.priority == "quality" else self._next_step_down()
             if smaller is None:
-                # At the floor (or in quality mode) the miss is reported once
-                # per sustained run; reporting is not gated by the change cooldown.
-                if self._limited_run == self.limit_streak:
+                # At the floor (or in quality mode) the miss is reported once per
+                # sustained run - exactly at the threshold crossing, which a slower
+                # telemetry cadence still hits exactly once. Reporting is not gated
+                # by the change cooldown.
+                if self._limited_seconds - step < self.limit_streak:
                     return {"action": "notice",
                             "reason": f"60 FPS не удерживаются: кодировщик ограничен, "
                                       f"достигнут нижний предел {self.floor} px"}
@@ -96,13 +105,13 @@ class AdaptiveQuality:
             settings["maxSize"] = smaller
             self._current = settings
             self._last_change_at = now
-            self._limited_run = 0
+            self._limited_seconds = 0.0
             return {"action": "configure", "settings": dict(settings),
                     "reason": f"Плавность: длинная сторона {smaller} px на время ограничения"}
-        if not limited and self._clean_run >= self.recovery_streak and self._current != self.base:
+        if not limited and self._clean_seconds >= self.recovery_streak and self._current != self.base:
             self._current = dict(self.base)
             self._last_change_at = now
-            self._clean_run = 0
+            self._clean_seconds = 0.0
             return {"action": "configure", "settings": dict(self._current),
                     "reason": "Плавность восстановлена: возвращён выбранный профиль"}
         return None
