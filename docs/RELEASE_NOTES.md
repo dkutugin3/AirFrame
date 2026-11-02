@@ -1,8 +1,37 @@
-# RELEASE NOTES — AirFrame 0.6.0 (runtime `eafe485`)
+# RELEASE NOTES — AirFrame 0.6.2 (runtime `815cadc` + release commit)
+
+## Current line: 0.6.0 → 0.6.2
+
+- **0.6.0/0.6.1 — HEVC/H.265 (stage 9b).** The desktop receives H.265 RTP
+  (RFC 7798) on the pinned aiortc 1.15.0 via a guarded runtime registration;
+  the phone prefers its hardware HEVC encoder when "Предпочесть HEVC/H.265" is
+  checked, H.264 stays the negotiated fallback. 0.6.1 keeps `preferHevc` in the
+  phone's ack (the checkbox no longer bounces) and shows the negotiated codec
+  in the desktop footer with offer/answer codec logging.
+- **0.6.2 — phone load.** Screen capture (and the high-perf WifiLock) runs only
+  while a peer session is live — it no longer burns display-rate GPU while the
+  service waits for a receiver (`CaptureGate`); `getStats` telemetry drops from
+  1 s to 2 s once a session is 30 s old; audio capture wakes its thread half as
+  often (8192-byte reads split safely across MediaCodec input buffers). The
+  desktop adaptive controller accumulates streaks in wall-clock seconds, so the
+  calmer telemetry does not slow adaptation. Verified: Java unit tests + APK
+  build in Docker, `tests/` 201 OK, `tests_native/` 91 OK. Real-phone battery
+  and thermal effect is **unverified** — measure on device.
+
+Suites at the 0.6.2 revision: `tests/` **Ran 201 tests, OK**;
+`tests_native/` (offscreen Qt) **Ran 91 tests, OK**; Android
+`:app:testDebugUnitTest` + `:app:assembleDebug` — BUILD SUCCESSFUL.
+
+---
+
+## Historical frozen-runtime notes (0.5.0-era evidence, kept for the record)
+
 Status: **release v0.5.0**. `pyproject.toml` version 0.5.0; the released runtime is
 commit `a981886` (stage-8 adaptive quality) plus docs-only commits; the finish pass
 `60cbcee` (review fixes I3/C1/I2/I6/I13) is part of the runtime. Published artifacts
 are rebuilt from this revision in `artifacts/2026-10-30-stable60fps/packages-finish/`.
+Everything below this marker describes that 0.5.0-era run; in particular the
+"HEVC not implemented" statements were superseded by 0.6.0.
 
 Suites at the release revision (raw logs):
 
