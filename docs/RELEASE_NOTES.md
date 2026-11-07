@@ -1,3 +1,18 @@
+# RELEASE NOTES — AirFrame 0.6.3
+
+Released: 2026-11-07. Focus: reliable HEVC, Windows receive path and less CPU work per frame.
+
+- **Windows:** explicit hardware mode now selects D3D11VA instead of macOS VideoToolbox; failures retain the software fallback and diagnostics report the actual mode. Automatic mode remains software until a native Windows benchmark justifies changing it. Set `AIRFRAME_HW_DECODE=hardware` before launch to opt in; this is not a zero-copy path.
+- **Rendering:** equivalent preview/OBS outputs share one owned Qt YUV buffer per source frame. Unsupported colour conversion is prepared off the GUI thread. A reproducible host microbenchmark for two 2560×1440 outputs reduced median preparation CPU time from 0.223 to 0.103 ms/frame (about 54%). This measures preparation only, not end-to-end FPS, latency or Windows GPU performance.
+- **HEVC:** fixed the decoder registry used by the actual Receiver, RFC 7798 FU packetization, and recovery gating after loss/overload. H.265 now has an end-to-end test through the production bounded decoder and playout.
+- **Android:** reconnect pauses/resumes one virtual display without reusing a consumed projection grant; preserves HEVC preference and resets the profile acknowledgement id on a fresh peer. Requests optional playback-audio permission on a fresh installation.
+- **Adaptation:** a first absolute monotonic timestamp, telemetry gaps, unknown status and cached sender samples no longer trigger a spurious resolution downgrade.
+- **Packaging/connectivity:** native PyInstaller builds collect application icons; LAN address discovery still falls back to the active route when hostname resolution fails. Android builds use a locked Gradle cache at the actual configured path.
+
+Verification and remaining platform boundaries: see [REVIEW_0.6.3.md](REVIEW_0.6.3.md). No physical Windows PC or Android phone was available for this release; no claim of maximum throughput or physical 60/120 FPS is made.
+
+---
+
 # RELEASE NOTES — AirFrame 0.6.2 (runtime `815cadc` + release commit)
 
 ## Current line: 0.6.0 → 0.6.2

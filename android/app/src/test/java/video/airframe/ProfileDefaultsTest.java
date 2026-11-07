@@ -50,6 +50,18 @@ public class ProfileDefaultsTest {
         assertBaseProfile(service);
     }
 
+    @Test public void offerSettingsKeepHevcAcrossRepeatedNegotiations() throws Exception {
+        ProjectionService service=new ProjectionService();
+        configure(service,new JSONObject("{\"fps\":60,\"bitrate\":24,\"maxSize\":2560,\"preferHevc\":true}"));
+        Method snapshot=ProjectionService.class.getDeclaredMethod("currentSettings");
+        snapshot.setAccessible(true);
+        for(int i=0;i<3;i++){
+            JSONObject settings=(JSONObject)snapshot.invoke(service);
+            assertEquals(true,settings.getBoolean("preferHevc"));
+            configure(service,settings);
+        }
+    }
+
     private static void configure(ProjectionService service, JSONObject settings) throws Exception {
         Method configure = ProjectionService.class.getDeclaredMethod("configure", JSONObject.class);
         configure.setAccessible(true);

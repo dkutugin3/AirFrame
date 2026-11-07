@@ -42,7 +42,7 @@ class AdaptiveWiringTests(unittest.TestCase):
         window.adaptive_now = lambda: (clock.__setitem__(0, clock[0] + 1.0) or clock[0])
         window.smoothness.setChecked(True)
         qt_harness.pump_for(0.02)
-        for _ in range(3):
+        for _ in range(4):  # first sample establishes the clock; then 3 seconds
             window.on_stats(self.stats("cpu", 41.0))
             qt_harness.pump_for(0.02)
         downgrades = [settings for settings, request_id in self.calls
@@ -74,6 +74,17 @@ class AdaptiveWiringTests(unittest.TestCase):
             window.on_stats(self.stats("cpu", 41.0))
             qt_harness.pump_for(0.02)
         self.assertEqual(len(self.calls), manual_count + 1)
+
+    def test_repeated_cached_sender_sample_does_not_accumulate_limitation(self):
+        window, server = self.window()
+        window.smoothness.setChecked(True)
+        clock = [90000.0]
+        window.adaptive_now = lambda: clock[0]
+        sample = {**self.stats('cpu', 41.0), 'sampledMonotonicMs': 1000}
+        for _ in range(6):
+            window.adaptive_observe(sample)
+            clock[0] += 1.0
+        self.assertEqual(self.calls, [], 'cached telemetry must not drive a downgrade')
 
 
 if __name__ == "__main__":

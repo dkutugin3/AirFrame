@@ -18,6 +18,7 @@ FLOOR_PROFILE = {"fps": 60, "bitrate": 24, "maxSize": 1920}
 class AdaptiveQualityTests(unittest.TestCase):
     def setUp(self):
         self.controller = AdaptiveQuality(base=dict(BASE), floor=1920)
+        self.controller.observe('none', 60.0, 0.0)
 
     def tick(self, seconds, limited, fps=41.0):
         """Advance whole seconds; return the list of actions produced."""
@@ -34,6 +35,26 @@ class AdaptiveQualityTests(unittest.TestCase):
 
     def test_single_bad_sample_changes_nothing(self):
         self.assertEqual(self.tick(1, limited=True), [])
+        self.assertEqual(self.controller.current_settings(), BASE)
+
+    def test_first_absolute_monotonic_sample_does_not_downgrade(self):
+        self.controller = AdaptiveQuality(base=dict(BASE), floor=1920)
+        self.assertIsNone(self.controller.observe('cpu', 41.0, 90000.0))
+        self.assertIsNone(self.controller.observe('cpu', 41.0, 90001.0))
+        self.assertIsNone(self.controller.observe('cpu', 41.0, 90002.0))
+        self.assertEqual(self.controller.observe('cpu', 41.0, 90003.0)['settings'], FLOOR_PROFILE)
+
+    def test_gap_does_not_count_as_sustained_limitation(self):
+        self.controller.observe('none', 60.0, 0.0)
+        self.controller.observe('cpu', 41.0, 1.0)
+        self.controller.observe('cpu', 41.0, 2.0)
+        self.assertIsNone(self.controller.observe('cpu', 41.0, 90.0))
+        self.assertIsNone(self.controller.observe('cpu', 41.0, 91.0))
+
+    def test_unknown_telemetry_is_not_evidence_of_encoder_limitation(self):
+        self.controller.observe('none', 60.0, 0.0)
+        for now in range(1, 12):
+            self.assertIsNone(self.controller.observe('unknown', 0.0, float(now)))
         self.assertEqual(self.controller.current_settings(), BASE)
 
     def test_sustained_limitation_allows_exactly_one_step(self):

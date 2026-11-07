@@ -555,6 +555,11 @@ def lan_addresses():
             ip = result[4][0]
             if not ipaddress.ip_address(ip).is_loopback:
                 addresses.add(ip)
+    except OSError:
+        pass
+    # A hostname can fail to resolve while the network route is healthy (for
+    # example a Windows DNS suffix/VPN setup). Keep both methods independent.
+    try:
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
             probe.connect(("192.0.2.1", 9))
             ip = probe.getsockname()[0]

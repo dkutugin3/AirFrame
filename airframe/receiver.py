@@ -426,7 +426,7 @@ class Receiver:
                 hw = self.decoder_factory.status_snapshot() if self.decoder_factory else {}
                 self.on_stats({**decode,
                                "hwDecodeRequested": str(hw.get("requestedMode", "")),
-                               "hwDecodeMode": str(hw.get("selectedMode", "")),
+                               "hwDecodeMode": str(hw.get("actualMode", hw.get("selectedMode", ""))),
                                "hwDecodeVerified": bool(hw.get("verifiedHardware", False)),
                                "hwDecodeReason": str(hw.get("reason") or "")[:200],
                                **self.sender_stats, **transport, **self.playout.metrics(),

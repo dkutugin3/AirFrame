@@ -229,6 +229,27 @@ class VideoBufferTests(unittest.TestCase):
 
 
 class LossDeadlineTests(unittest.TestCase):
+    def test_hevc_recovery_waits_for_random_access_after_loss(self):
+        clock = FakeClock()
+        buffer = VideoBuffer(clock=clock, codecs={96: 'video/H265'})
+        dependent = b'\x00\x00\x00\x01\x02\x01p'
+        idr = b'\x00\x00\x00\x01\x26\x01i'
+        sets = b''.join(b'\x00\x00\x00\x01' + bytes([kind << 1, 1]) + b's'
+                        for kind in (32, 33, 34))
+        buffer.add(raw_packet(0, 0, sets + idr))
+        buffer.add(raw_packet(2, 3000, dependent))  # missing sequence 1
+        self.assertTrue(buffer.expire(.16))
+        self.assertTrue(buffer.awaiting_keyframe)
+        buffer.add(raw_packet(3, 4500, dependent))
+        _, frame = buffer.add(raw_packet(4, 6000, dependent))
+        self.assertIsNone(frame)
+        self.assertTrue(buffer.awaiting_keyframe)
+        buffer.add(raw_packet(5, 7500, sets + idr))
+        _, frame = buffer.add(raw_packet(6, 9000, dependent))
+        self.assertIsNotNone(frame)
+        self.assertEqual(frame.data, sets + idr)
+        self.assertFalse(buffer.awaiting_keyframe)
+
     def test_retransmission_before_deadline_preserves_frame_without_pli(self):
         clock = FakeClock()
         buffer = VideoBuffer(clock=clock)

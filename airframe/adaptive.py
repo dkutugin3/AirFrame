@@ -24,7 +24,7 @@ LIMIT_STREAK = 3          # consecutive limited seconds before one downgrade
 RECOVERY_STREAK = 15      # consecutive clean seconds before restoring quality
 MIN_CHANGE_INTERVAL = 10.0  # seconds between any two proposals
 LADDER = (2560, 1920)     # the only controlled reduction step of the long side
-MAX_STEP = 5.0            # seconds credited for one sample; a telemetry gap is not evidence
+MAX_STEP = 5.0            # longer gaps break a streak: silence is not evidence
 
 
 class AdaptiveQuality:
@@ -41,6 +41,7 @@ class AdaptiveQuality:
         self.base = dict(base)
         self._current = dict(base)
         self.clock = 0.0
+        self._sampled = False
         self._limited_seconds = 0.0
         self._clean_seconds = 0.0
         self._last_change_at = None
@@ -76,9 +77,15 @@ class AdaptiveQuality:
         ``now`` is monotonic seconds. Streaks are the wall-clock duration of the
         run, so a slower telemetry cadence does not slow the controller down.
         """
-        step = min(max(0.0, now - self.clock), MAX_STEP)
+        step = now - self.clock
         self.clock = now
-        if self._manual or step <= 0.0 and now != 0.0:
+        if not self._sampled:
+            self._sampled = True
+            return None
+        if self._manual:
+            return None
+        if step <= 0.0 or step > MAX_STEP or limited == "unknown":
+            self._limited_seconds = self._clean_seconds = 0.0
             return None
         limited = limited != "none"
         if limited:

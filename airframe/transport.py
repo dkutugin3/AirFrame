@@ -33,6 +33,8 @@ _NACK_ATTRIBUTE = '_RTCRtpReceiver__nack_generator'
 H264_NAL_IDR = 5
 H264_NAL_SPS = 7
 H264_NAL_PPS = 8
+H265_RANDOM_ACCESS = frozenset(range(16, 22))
+H265_PARAMETER_SETS = frozenset((32, 33, 34))
 
 
 def h264_nal_types(data):
@@ -46,6 +48,20 @@ def h264_nal_types(data):
         header = found + 3
         if header < len(data):
             types.add(data[header] & 0x1f)
+        index = header
+
+
+def h265_nal_types(data):
+    """HEVC NAL unit types of an Annex-B access unit (RFC 7798 output)."""
+    types = set()
+    index = 0
+    while True:
+        found = data.find(b'\x00\x00\x01', index)
+        if found < 0:
+            return types
+        header = found + 3
+        if header + 1 < len(data):
+            types.add((data[header] >> 1) & 0x3f)
         index = header
 
 
@@ -81,6 +97,7 @@ class VideoBuffer(JitterBuffer):
         self._recovery_seq_floor = None
         self._codec_family = None
         self._sps_seen = self._pps_seen = False
+        self._hevc_parameter_sets = set()
         self._events = {'expiries': 0, 'recoveries': 0, 'ssrc': 0}
         self._metrics = {'expiries': 0, 'recoveries': 0, 'ssrc': 0}
 
@@ -187,6 +204,8 @@ class VideoBuffer(JitterBuffer):
         mime = (mime_type or '').lower()
         if 'h264' in mime:
             return 'h264'
+        if 'h265' in mime:
+            return 'h265'
         if 'vp8' in mime:
             return 'vp8'
         return mime or None
@@ -203,11 +222,18 @@ class VideoBuffer(JitterBuffer):
             return (H264_NAL_IDR in types) and self._sps_seen and self._pps_seen
         if family == 'vp8':
             return bool(frame.data) and (frame.data[0] & 0x01) == 0
+        if family == 'h265':
+            types = h265_nal_types(frame.data)
+            self._hevc_parameter_sets.update(types & H265_PARAMETER_SETS)
+            return bool(types & H265_RANDOM_ACCESS) and H265_PARAMETER_SETS <= self._hevc_parameter_sets
         # Unknown codec: no silent P-frame gating; the decoder/higher layer
         # resumes on the keyframe requested by the PLI.
         return True
 
     def _note_parameter_sets(self, frame):
+        if self._codec_family == 'h265':
+            self._hevc_parameter_sets.update(h265_nal_types(frame.data) & H265_PARAMETER_SETS)
+            return
         if self._codec_family != 'h264':
             return
         types = h264_nal_types(frame.data)

@@ -30,7 +30,8 @@ COPY . .
 RUN mkdir -p signing && if [ ! -s signing/debug.keystore ]; then \
     keytool -genkeypair -keystore signing/debug.keystore -storepass android -keypass android \
     -alias androiddebugkey -dname "CN=Android Debug,O=Android,C=US" -keyalg RSA -keysize 2048 -validity 10000; fi
-RUN --mount=type=cache,target=/root/.gradle gradle --no-daemon :app:assembleDebug :app:testDebugUnitTest :app:lintDebug
+RUN --mount=type=cache,target=/root/.gradle,sharing=locked \
+    GRADLE_USER_HOME=/root/.gradle gradle --no-daemon :app:assembleDebug :app:testDebugUnitTest :app:lintDebug
 RUN mkdir /out && cp app/build/outputs/apk/debug/app-debug.apk /out/AirFrame-android-debug.apk \
     && cp app/build/reports/lint-results-debug.html /out/android-lint.html
 

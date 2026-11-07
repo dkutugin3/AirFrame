@@ -42,6 +42,10 @@ class NativeVideoTests(AioHTTPTestCase):
     async def test_h264_reaches_native_decoder(self):
         await self.check_video('video/H264')
 
+    async def test_h265_reaches_native_decoder(self):
+        # Exercise the actual Receiver factory, not only aiortc's decoder registry.
+        await self.check_video('video/H265')
+
     async def test_large_h264_keyframe_over_real_webrtc(self):
         from test_transport import large_h264_packet
         class LargeFrameTrack(VideoStreamTrack):
@@ -98,6 +102,35 @@ class DummyPeer:
 
 
 class LatestFrameTests(unittest.IsolatedAsyncioTestCase):
+    async def test_statistics_reports_actual_software_mode_after_hardware_fallback(self):
+        class Peer:
+            async def getStats(self):
+                return {}
+
+        class Factory:
+            def status_snapshot(self):
+                return {'selectedMode': 'hardware', 'actualMode': 'software',
+                        'verifiedHardware': False, 'reason': 'GPU device lost'}
+
+        metrics = []
+        receiver = Receiver(Room(), lambda *args: None, lambda *args: None,
+                            metrics.append, lambda *args: None)
+        peer = receiver.peer = Peer()
+        receiver.decoder_factory = Factory()
+        worker = asyncio.create_task(receiver.statistics(peer))
+        try:
+            for _ in range(150):
+                if metrics:
+                    break
+                await asyncio.sleep(.01)
+            self.assertTrue(metrics)
+            self.assertEqual(metrics[0]['hwDecodeMode'], 'software')
+            self.assertFalse(metrics[0]['hwDecodeVerified'])
+        finally:
+            receiver.peer = None
+            worker.cancel()
+            await asyncio.gather(worker, return_exceptions=True)
+
     async def test_slow_conversion_does_not_backlog_decoded_frames(self):
         import threading
         from aiortc.mediastreams import MediaStreamError

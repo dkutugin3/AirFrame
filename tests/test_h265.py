@@ -63,6 +63,14 @@ def payload_header(nal: bytes) -> bytes:
 
 
 class H265DepacketizerTests(unittest.TestCase):
+    def test_encoder_fragmentation_round_trips_the_original_nal(self):
+        nal = bytes([19 << 1, 1]) + b'payload' * 600
+        payloads = h265.H265Encoder()._packetize([nal])
+        self.assertGreater(len(payloads), 1)
+        self.assertTrue(all(len(payload) <= h265.PACKET_MAX for payload in payloads))
+        decoded = b''.join(h265.h265_depayload(payload) for payload in payloads)
+        self.assertEqual(decoded, h265.START_CODE + nal)
+
     def test_single_nal_passes_with_start_code(self):
         nal = VECTOR_NALS()[0]
         out = h265.h265_depayload(nal)

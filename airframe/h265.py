@@ -161,12 +161,16 @@ class H265Encoder(Encoder):
     @staticmethod
     def _packetize_fu(nal: bytes) -> List[bytes]:
         available = PACKET_MAX - PAYLOAD_HEADER_SIZE - FU_HEADER_SIZE
-        chunks = [nal[i:i + available] for i in range(0, len(nal), available)]
+        # RFC 7798: replace the original two-byte NAL header with a type-49
+        # payload header and FU header; only the NAL body is fragmented.
+        body = nal[PAYLOAD_HEADER_SIZE:]
+        chunks = [body[i:i + available] for i in range(0, len(body), available)]
+        header = bytes([(nal[0] & 0x81) | (NAL_TYPE_FU << 1), nal[1]])
         packages = []
         for i, chunk in enumerate(chunks):
             first, last = i == 0, i == len(chunks) - 1
             fu_header = bytes([(0x80 if first else 0) | (0x40 if last else 0) | _nal_type(nal)])
-            packages.append(nal[:PAYLOAD_HEADER_SIZE] + fu_header + chunk)
+            packages.append(header + fu_header + chunk)
         return packages
 
     def _packetize(self, nals: List[bytes]) -> List[bytes]:

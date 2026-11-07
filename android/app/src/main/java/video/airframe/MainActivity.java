@@ -1,12 +1,15 @@
 package video.airframe;
 
+import android.Manifest;
 import android.app.Activity;
 import com.google.zxing.integration.android.IntentIntegrator;
 import com.google.zxing.integration.android.IntentResult;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.media.projection.MediaProjectionManager;
 import android.os.Bundle;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.text.InputType;
@@ -115,6 +118,22 @@ public class MainActivity extends Activity {
     private void beginCapture(String target,String credential) {
         if(ProjectionService.running)return;
         pendingAddress=target; pendingCode=credential;
+        if(Build.VERSION.SDK_INT>=29 && checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                !=PackageManager.PERMISSION_GRANTED){
+            requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO},101);
+            return;
+        }
+        requestProjection();
+    }
+
+    @Override public void onRequestPermissionsResult(int request,String[] permissions,int[] results){
+        super.onRequestPermissionsResult(request,permissions,results);
+        // Playback capture is optional: declining microphone permission must not block video.
+        if(request==101 && !ProjectionService.running && pendingAddress!=null && pendingCode!=null)
+            requestProjection();
+    }
+
+    private void requestProjection(){
         MediaProjectionManager manager=(MediaProjectionManager)getSystemService(MEDIA_PROJECTION_SERVICE);
         startActivityForResult(manager.createScreenCaptureIntent(), 100);
     }

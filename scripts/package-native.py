@@ -7,5 +7,6 @@ root = Path(__file__).resolve().parents[1]
 subprocess.run([
     sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean", "--windowed",
     "--onedir", "--name", "AirFrame", "--collect-all", "aiortc", "--collect-all", "av",
+    "--collect-data", "airframe",
     str(root / "scripts" / "desktop-entry.py"),
 ], cwd=root, check=True)

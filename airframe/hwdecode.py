@@ -28,7 +28,8 @@ What was measured on this stand (Apple M4, PyAV 17.1.0, real libx264 H.264
 Selection contract:
 
 * ``software`` - exactly the aiortc/FFmpeg software decoder, no hardware context.
-* ``hardware`` - verified VideoToolbox context; if the device is unavailable the
+* ``hardware`` - native device (VideoToolbox on macOS, D3D11VA on Windows);
+  if the device is unavailable the
   status honestly says ``actualMode="software"`` with the reason (it is never
   labelled hardware).
 * ``auto`` - only a verified path is used; on this pinned stack it selects
@@ -43,13 +44,13 @@ reason, and never re-creates the hardware context in the same session (no retry
 loop). ``close()`` releases both contexts.
 """
 import os
+import sys
 import time
 from dataclasses import dataclass
 from fractions import Fraction
 
 import av
 import av.codec.hwaccel as av_hwaccel
-from aiortc.codecs import get_decoder as aiortc_get_decoder
 
 from .transport import H264_NAL_IDR, h264_nal_types
 
@@ -60,7 +61,14 @@ MODES = (MODE_AUTO, MODE_HARDWARE, MODE_SOFTWARE)
 
 DEVICE_VIDEOTOOLBOX = "videotoolbox"
 DEVICE_D3D11VA = "d3d11va"
-DEFAULT_DEVICE = DEVICE_VIDEOTOOLBOX
+
+
+def default_hardware_device():
+    """Use the native decode API of the receiver's platform."""
+    return DEVICE_D3D11VA if sys.platform == 'win32' else DEVICE_VIDEOTOOLBOX
+
+
+DEFAULT_DEVICE = default_hardware_device()
 
 #: Measured on this stand: PyAV 17.1.0 VideoToolbox is slower for the target
 #: 2560x1440@60 H.264 stream, so `auto` keeps the software decoder by default.
@@ -190,7 +198,7 @@ class DecoderStatus(dict):
 class H264HardwareDecoder:
     """aiortc-compatible H.264 decoder (``decode(JitterFrame) -> frames``).
 
-    ``mode="hardware"`` starts on VideoToolbox and never retries it after a
+    ``mode="hardware"`` starts on the selected native device and never retries it after a
     failure; ``mode="software"`` is the untouched aiortc/FFmpeg behaviour
     (same PyAV context, same packet timestamps).
     """
@@ -412,7 +420,10 @@ class DecoderFactory:
         if probe_result.verified and prefer_hardware:
             self.status.update(selectedMode=MODE_HARDWARE, hardwareVerified=True)
         elif probe_result.verified:
-            self.status.update(selectedMode=MODE_SOFTWARE, reason=AUTO_SOFTWARE_POLICY)
+            reason = (AUTO_SOFTWARE_POLICY if device_type == DEVICE_VIDEOTOOLBOX else
+                      f"software: {device_type} hardware H.264 decode is not benchmarked on "
+                      "this platform; use AIRFRAME_HW_DECODE=hardware to opt in")
+            self.status.update(selectedMode=MODE_SOFTWARE, reason=reason)
         else:
             self.status.update(
                 selectedMode=MODE_SOFTWARE,
@@ -433,7 +444,10 @@ class DecoderFactory:
         byte-identical for codecs this stage does not touch.
         """
         if codec is not None and not self._is_h264(codec):
-            return aiortc_get_decoder(codec)
+            # H.265 is registered after this module is imported. Resolve the
+            # active registry at use time, just like the bounded decode layer.
+            from . import decode as decode_layer
+            return decode_layer.get_decoder(codec)
         mode = self.status["selectedMode"]
         decoder = H264HardwareDecoder(
             device_type=self.device_type,
@@ -477,16 +491,18 @@ def _env_prefers_hardware():
     return value in ("1", "hardware", "videotoolbox", "yes", "on")
 
 
-def select_decoder_factory(mode=None, device_type=DEFAULT_DEVICE, probe=None,
+def select_decoder_factory(mode=None, device_type=None, probe=None,
                            prefer_hardware=None, clock=time.monotonic, log=None):
     """Build the decoder factory for the stage-4 integration layer.
 
     ``mode`` defaults to ``AIRFRAME_HW_DECODE`` (``auto`` when unset); a bare
     ``AIRFRAME_HW_DECODE=hardware`` opts the auto policy into the verified
-    VideoToolbox path. Forced ``hardware`` is never downgraded silently: the
+    native hardware path. Forced ``hardware`` is never downgraded silently: the
     factory status carries the reason when the device cannot be verified.
     """
     env = os.environ.get("AIRFRAME_HW_DECODE", "").strip().lower()
+    if device_type is None:
+        device_type = default_hardware_device()
     if mode is None:
         mode = MODE_HARDWARE if env == MODE_HARDWARE else (MODE_SOFTWARE if env == MODE_SOFTWARE else MODE_AUTO)
     if prefer_hardware is None:

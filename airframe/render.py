@@ -353,6 +353,22 @@ class Renderer:
     def prepare(self, frame, *, serial):
         raise NotImplementedError
 
+    def prepare_shared(self, frame, *, serial, cache):
+        """Reuse one immutable preparation for equivalent built-in outputs.
+
+        The cache lives for one Frames.put only. Custom renderers keep their own
+        prepare calls, since their output may depend on per-instance settings.
+        Qt sinks share the read-only QVideoFrame through Qt's buffer ownership.
+        """
+        key = type(self) if type(self) in (QtVideoRenderer, SoftwareVideoRenderer) else None
+        if key is not None and key in cache:
+            self._prepared_frames += 1
+            return cache[key]
+        prepared = self.prepare(frame, serial=serial)
+        if key is not None:
+            cache[key] = prepared
+        return prepared
+
     def _render(self, prepared):
         raise NotImplementedError
 
@@ -455,6 +471,7 @@ class QtVideoRenderer(Renderer):
             height=frame.height,
             rotation=rotation,
             qframe=qframe,
+            image=software_image_from_av(frame, rotation=rotation) if qframe is None else None,
             source=frame,  # pinned until present() converted/uploaded it
         )
         self._prepared_frames += 1

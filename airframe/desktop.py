@@ -160,6 +160,7 @@ class Frames:
             notify = not self.notification_pending
             self.notification_pending = True
         ready = {}
+        preparation_cache = {}
         if frame is not None:
             for key, renderer in renderers:
                 try:
@@ -167,7 +168,7 @@ class Frames:
                         continue
                     if key == "preview" and stride > 1 and serial % stride == 0:
                         continue
-                    ready[key] = renderer.prepare(frame, serial=serial)
+                    ready[key] = renderer.prepare_shared(frame, serial=serial, cache=preparation_cache)
                 except Exception as error:
                     # One broken output must not stop the other one or the mailbox.
                     renderer.note_prepare_error(error)
@@ -629,6 +630,7 @@ class Desktop(QMainWindow):
         self.adaptive = AdaptiveQuality(base=video_settings(dict(self.server.room.saved_profile)),
                                         floor=1920, priority="quality")
         self.adaptive_now = time.monotonic
+        self.adaptive_sample_at = None
         ql.addWidget(text("120 fps — экспериментальный режим. Фактическая частота зависит от телефона, сети и компьютера.","muted",True))
         ql.addStretch()
 
@@ -681,7 +683,7 @@ class Desktop(QMainWindow):
         body.addWidget(self.settings_tabs)
         layout.addLayout(body,1)
         footer = QHBoxLayout()
-        footer.addWidget(text("AirFrame 0.6.2 · Локальная трансляция","muted"))
+        footer.addWidget(text("AirFrame 0.6.3 · Локальная трансляция","muted"))
         footer.addStretch()
         diagnostics = QPushButton("Диагностика и помощь")
         diagnostics.clicked.connect(self.show_diagnostics)
@@ -859,9 +861,14 @@ class Desktop(QMainWindow):
                                  else "качество (разрешение не снижается)"))
 
     def adaptive_observe(self, stats):
-        """Feed the 1 Hz sender telemetry to the compromise controller."""
+        """Feed fresh sender telemetry, ignoring cached copies in PC statistics."""
         if not stats or "encodedFps" not in stats:
             return
+        sampled_at = stats.get("sampledMonotonicMs")
+        if sampled_at is not None:
+            if sampled_at == self.adaptive_sample_at:
+                return
+            self.adaptive_sample_at = sampled_at
         action = self.adaptive.observe(limited=stats.get("limitation", "unknown"),
                                        encoded_fps=stats.get("encodedFps", 0.0),
                                        now=self.adaptive_now())
@@ -950,6 +957,7 @@ class Desktop(QMainWindow):
             self.server.set_audio(self.audio_capture.isChecked())
             # New media session: cumulative telemetry counters restart.
             self.telemetry.reset()
+            self.adaptive_sample_at = None
             self.last_bottleneck = None
         self.log(detail)
 

@@ -167,6 +167,13 @@ class BoundedQueueTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DecodePipelineTests(unittest.IsolatedAsyncioTestCase):
+    def test_hevc_recovery_rejects_dependent_frames(self):
+        codec = RTCRtpCodecParameters(mimeType='video/H265', clockRate=90000)
+        dependent = encoded(0, b'\x00\x00\x00\x01\x02\x01p')
+        random_access = encoded(0, b'\x00\x00\x00\x01\x26\x01i')
+        self.assertFalse(DecodePipeline._is_keyframe(codec, dependent))
+        self.assertTrue(DecodePipeline._is_keyframe(codec, random_access))
+
     def make_pipeline(self, clock=None, decoder_factory=None, fps=60):
         clock = clock or FakeClock()
         pipeline = DecodePipeline(asyncio.get_running_loop(), clock=clock, fps=fps,

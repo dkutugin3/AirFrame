@@ -32,7 +32,8 @@ from collections import deque
 import aiortc
 from aiortc.codecs import get_decoder
 
-from .transport import H264_NAL_IDR, VIDEO_LOSS_DEADLINE, h264_nal_types
+from .transport import (H264_NAL_IDR, H265_RANDOM_ACCESS, VIDEO_LOSS_DEADLINE,
+                        h264_nal_types, h265_nal_types)
 
 #: Age limit for encoded access units waiting for the decoder (from enqueue time).
 PRE_DECODER_AGE = VIDEO_LOSS_DEADLINE
@@ -468,6 +469,8 @@ class DecodePipeline:
         data = getattr(encoded_frame, 'data', b'')
         if 'h264' in mime:
             return H264_NAL_IDR in h264_nal_types(data)
+        if 'h265' in mime:
+            return bool(h265_nal_types(data) & H265_RANDOM_ACCESS)
         if 'vp8' in mime:
             return bool(data) and (data[0] & 0x01) == 0
         # Unknown codec: the decoder resumes on the keyframe the PLI requested.

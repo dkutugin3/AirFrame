@@ -32,7 +32,6 @@ import org.json.JSONObject;
 import org.webrtc.*;
 import okhttp3.*;
 
-import java.lang.reflect.Field;
 import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -47,7 +46,7 @@ public class ProjectionService extends Service {
     private WebSocket socket;
     private EglBase egl;
     private PeerConnectionFactory factory;
-    private ScreenCapturerAndroid capturer;
+    private ScreenCapture capturer;
     private SurfaceTextureHelper texture;
     private VideoSource source;
     private VideoTrack track;
@@ -163,7 +162,7 @@ public class ProjectionService extends Service {
                     .createPeerConnectionFactory();
             texture=SurfaceTextureHelper.create("AirFrame-capture",egl.getEglBaseContext());
             source=factory.createVideoSource(true);
-            capturer=new ScreenCapturerAndroid(permission,new MediaProjection.Callback(){
+            capturer=new ScreenCapture(permission,new MediaProjection.Callback(){
                 @Override public void onStop(){main.post(()->{if(!closing){status="Захват завершён системой. Разрешите его заново.";stopSelf();}});}
                 @Override public void onCapturedContentResize(int width,int height){main.post(()->resize(width,height));}
             });
@@ -194,16 +193,11 @@ public class ProjectionService extends Service {
      * io.github.webrtc-sdk has no setAudioRecord(AudioRecord) to feed an AudioPlaybackCapture
      * AudioRecord into JavaAudioDeviceModule. We capture playback PCM ourselves, encode AAC
      * with MediaCodec and send self-describing config+frame messages; the desktop decodes
-     * with PyAV. The projection for playback capture is taken from ScreenCapturerAndroid
-     * via reflection, so the single projection grant is never consumed twice.
+     * with PyAV. Video and playback capture share the same projection grant.
      */
     private MediaProjection projectionForAudio() {
         if(Build.VERSION.SDK_INT<29)return null;
-        try{
-            Field field=ScreenCapturerAndroid.class.getDeclaredField("mediaProjection");
-            field.setAccessible(true);
-            return (MediaProjection)field.get(capturer);
-        }catch(Exception error){return null;}
+        return capturer==null?null:capturer.getMediaProjection();
     }
 
     private void startAudio() {
@@ -356,6 +350,11 @@ public class ProjectionService extends Service {
         if(codecChanged && peer!=null && remoteSet)scheduleRestart();
     }
 
+    /** Full profile for offers and acknowledgements, including the requested codec. */
+    private JSONObject currentSettings(){
+        return json("fps",fps,"bitrate",bitrate,"maxSize",maxSize,"preferHevc",preferHevc);
+    }
+
     /** Pure ordering for unit tests: preferred codec first, H.264 next, rest unchanged. */
     static void sortCodecPreferences(List<RtpCapabilities.CodecCapability> codecs, boolean hevcFirst) {
         String preferred=hevcFirst ? "H265" : "H264";
@@ -411,8 +410,7 @@ public class ProjectionService extends Service {
         applied=applied && budget;
         status=applied ? "Профиль применён · "+fps+" fps · до "+maxSize+" px" : "Кодировщик отклонил профиль";
         send(json("type","configured","requestId",profileRequest,"applied",applied,
-                "settings",json("fps",fps,"bitrate",bitrate,"maxSize",maxSize,
-                        "preferHevc",preferHevc)));
+                "settings",currentSettings()));
     }
 
     private void connect() {
@@ -442,7 +440,7 @@ public class ProjectionService extends Service {
     private void message(JSONObject message) throws Exception {
         switch(message.getString("type")) {
             case "authenticated":credential=message.getString("resumeToken");status="Ожидание приёмника…";break;
-            case "peer-ready":configure(message.optJSONObject("settings"));offer();break;
+            case "peer-ready":profileRequest="";configure(message.optJSONObject("settings"));offer();break;
             case "configure":profileRequest=message.optString("requestId");configure(message.optJSONObject("settings"));break;
             case "answer":
                 if(!message.optString("session").equals(String.valueOf(generation)))break;
@@ -527,7 +525,7 @@ public class ProjectionService extends Service {
         for(RtpTransceiver transceiver:peer.getTransceivers())
             if(transceiver.getMediaType()==MediaStreamTrack.MediaType.MEDIA_TYPE_VIDEO)
                 transceiver.setCodecPreferences(codecs);
-        configure(json("fps",fps,"bitrate",bitrate,"maxSize",maxSize));
+        configure(currentSettings());
         telemetryFastUntil=SystemClock.elapsedRealtime()+TELEMETRY_FAST_MS;
         captureGate.onOffer();syncCaptureToGate(); // frames flow only from the first offer on
         final PeerConnection current=peer;
