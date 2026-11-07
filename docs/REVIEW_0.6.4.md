@@ -1,10 +1,12 @@
-# AirFrame 0.6.3 code review
+# AirFrame 0.6.4 code review
 
 Date: 2026-11-07. Base: `1fb3fe2` (0.6.2). User scope: review the full application, particularly Windows, fix confirmed problems and release.
 
 ## Reviewed paths
 
 Android pairing, permission/service lifecycle, frame pacing, encoder settings and audio; authenticated local signalling and profile acknowledgements; RTP depayload/reassembly and loss recovery; decoder selection, bounded queues and playout; Qt buffer ownership, colours, GUI handoff and two-window rendering; Windows launcher, embedded runtime, DLL/plugin payload, portable/PyInstaller packaging and platform verification scripts. Independent final review found no additional confirmed regression in the integrated patch.
+
+The initial 0.6.3 draft was not published. Remote x86 Docker verification exposed tests averaging visible luma together with row padding. The corrected fixtures and a visible-pixel regression are included in 0.6.4; release-source tags are not rewritten.
 
 ## Confirmed fixes
 
@@ -28,9 +30,9 @@ Android pairing, permission/service lifecycle, frame pacing, encoder settings an
 
 ## Verification
 
-- Full host headless suite: **214 tests passed**, including real local H.264 and HEVC production-receiver tests.
+- Full host headless suite: **216 tests passed**, including real local H.264 and HEVC production-receiver tests.
 - Full native/offscreen Qt suite: **94 tests passed**, including frame ownership, colour/stride, profile/control, decoder-fallback and preparation regressions.
-- All three portable builds completed; Docker runs the complete 214-test suite. The fresh Windows archive passed 29 offline composition/source/version checks; both macOS archives match the reviewed source, and the Apple Silicon bundled interpreter imported the application successfully. Android `assembleDebug`, `testDebugUnitTest`, and `lintDebug` completed successfully (49 executed Gradle tasks): **39 JVM tests, zero failures/errors/skips**. `aapt2` confirms versionName 0.6.3 / versionCode 11; `apksigner verify` passed. APK, JUnit XML, manifest/signature evidence and lint HTML are exported with the release artifacts.
+- All three portable builds completed; Docker runs the complete 216-test suite. The fresh Windows archive passed 29 offline composition/source/version checks; both macOS archives match the reviewed source, and the Apple Silicon bundled interpreter imported the application successfully. Android `assembleDebug`, `testDebugUnitTest`, and `lintDebug` completed successfully (49 executed Gradle tasks): **39 JVM tests, zero failures/errors/skips**. `aapt2` confirms versionName 0.6.4 / versionCode 12; `apksigner verify` passed. APK, JUnit XML, manifest/signature evidence and lint HTML are exported with the release artifacts.
 - Desktop and receive-pipeline regression tests were observed failing before their fixes. Android lifecycle contracts have added JVM tests; the earlier Docker mutation build was cancelled during dependency setup, so no Android red-run claim is made. The complete suite is rerun during Docker wheel/portable builds.
 - Host YUV preparation microbenchmark: two active Qt outputs, one 2560×1440 YUV420 source, 30 warmup frames and five runs of 240 frames. Median process CPU: **0.223 → 0.103 ms/source frame**. No physical display is exercised. Raw reports: `verify/render-before.json` and `verify/render-after.json` in the release artifact folder.
 

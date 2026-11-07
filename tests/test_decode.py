@@ -118,12 +118,27 @@ def h264_stream(count, keyframes=(0,), width=160, height=90):
 
 
 def luma_id(frame):
-    plane = bytes(frame.planes[0])
-    mean = sum(plane) / len(plane)
+    # Decoder strides differ by SIMD alignment (e.g. width 160 / stride 256
+    # on x86). Padding is not picture data and cannot encode the fixture ID.
+    plane = frame.planes[0]
+    pixels = memoryview(plane)
+    total = sum(sum(pixels[row * plane.line_size:row * plane.line_size + frame.width])
+                for row in range(frame.height))
+    mean = total / (frame.width * frame.height)
     return max(0, round((mean - LUMA_BASE) / LUMA_STEP))
 
 
 class BoundedQueueTests(unittest.IsolatedAsyncioTestCase):
+    def test_fixture_frame_id_ignores_luma_stride_padding(self):
+        frame = av.VideoFrame(17, 9, 'yuv420p')
+        plane = frame.planes[0]
+        plane.update(bytes(plane.buffer_size))
+        pixels = memoryview(plane)
+        for row in range(frame.height):
+            start = row * plane.line_size
+            pixels[start:start + frame.width] = bytes([LUMA_BASE + 13 * LUMA_STEP]) * frame.width
+        self.assertEqual(luma_id(frame), 13)
+
     def test_encoded_queue_bounds_count_bytes_age_and_closes_cleanly(self):
         clock = FakeClock()
         queue = BoundedFrameQueue(max_frames=3, max_bytes=2500, clock=clock)

@@ -132,8 +132,13 @@ def vp8_stream(count=13, width=160, height=90, keyframe_indices=(0, 11)):
 
 
 def frame_luma(frame):
-    plane = bytes(frame.planes[0])
-    return sum(plane) / len(plane)
+    # The decoder may align rows beyond the visible width, especially on
+    # x86. Padding bytes are neither pixels nor part of our frame-ID signal.
+    plane = frame.planes[0]
+    pixels = memoryview(plane)
+    total = sum(sum(pixels[row * plane.line_size:row * plane.line_size + frame.width])
+                for row in range(frame.height))
+    return total / (frame.width * frame.height)
 
 
 def large_h264_packet():
@@ -171,6 +176,16 @@ def h264_nal_types(data):
 
 
 class VideoBufferTests(unittest.TestCase):
+    def test_fixture_frame_id_ignores_luma_stride_padding(self):
+        frame = av.VideoFrame(17, 9, 'yuv420p')
+        plane = frame.planes[0]
+        plane.update(bytes(plane.buffer_size))
+        pixels = memoryview(plane)
+        for row in range(frame.height):
+            start = row * plane.line_size
+            pixels[start:start + frame.width] = bytes([LUMA_BASE + 13 * LUMA_STEP]) * frame.width
+        self.assertEqual(luma_id(frame), 13)
+
     def test_large_frame_is_not_truncated_on_lossless_link(self):
         expected=b''.join(bytes([i%256])*1200 for i in range(300))
         buffer=VideoBuffer();frames=[];pli_count=0
