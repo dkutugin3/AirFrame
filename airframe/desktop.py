@@ -683,7 +683,7 @@ class Desktop(QMainWindow):
         body.addWidget(self.settings_tabs)
         layout.addLayout(body,1)
         footer = QHBoxLayout()
-        footer.addWidget(text("AirFrame 0.6.4 · Локальная трансляция","muted"))
+        footer.addWidget(text("AirFrame 0.6.5 · Локальная трансляция","muted"))
         footer.addStretch()
         diagnostics = QPushButton("Диагностика и помощь")
         diagnostics.clicked.connect(self.show_diagnostics)

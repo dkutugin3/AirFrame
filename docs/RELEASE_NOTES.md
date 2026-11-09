@@ -1,3 +1,27 @@
+# RELEASE NOTES — AirFrame 0.6.5
+
+Released: 2026-11-10. Focus: lower unnecessary Android resource usage and reliable audio cleanup.
+
+- **Capture and power:** screen capture starts after ICE/DTLS connects, pauses during media
+  disconnection/retry, and resumes the same projection grant after recovery. CPU/Wi-Fi performance
+  locks and statistics polling now follow active media instead of keeping a waiting phone awake.
+- **Audio lifecycle:** each worker owns its recorder, AAC encoder and transport. Failed startup,
+  terminal/empty recorder reads and stopped sessions release resources without a hot retry loop.
+  A quick audio off/on safely waits for old cleanup; stale workers cannot release a replacement.
+- **Audio memory:** packets reuse worker-owned storage and avoid an intermediate payload copy.
+  The native data-channel observer and reference are explicitly released, with sends serialized
+  against disposal. AAC format and compatibility with receiver 0.6.4 are preserved.
+- **Quality:** selected FPS, size and bitrate are preserved. For ROG Phone 6, the existing
+  “Плавность · 60 fps” profile (1920 px, 16 Mbit/s) is a suggested starting point.
+- **Versions:** Android version code 13; Python package/runtime and desktop footer use 0.6.5.
+
+Verification: 50 Android JVM tests, APK build and lint; desktop AAC-to-PCM compatibility test.
+Full desktop package checks are recorded with the release artifacts. Phone battery, thermals,
+actual encoder selection and FPS remain unmeasured on physical Android hardware. Native Windows
+GPU performance remains unverified. See [ANDROID_PERFORMANCE.md](ANDROID_PERFORMANCE.md).
+
+---
+
 # RELEASE NOTES — AirFrame 0.6.4
 
 Released: 2026-11-07. Version 0.6.3 was staged but not published; 0.6.4 includes the x86 test-fixture correction without rewriting that tag. Focus: reliable HEVC, Windows receive path and less CPU work per frame.
@@ -10,7 +34,7 @@ Released: 2026-11-07. Version 0.6.3 was staged but not published; 0.6.4 includes
 - **Adaptation:** a first absolute monotonic timestamp, telemetry gaps, unknown status and cached sender samples no longer trigger a spurious resolution downgrade.
 - **Packaging/connectivity:** native PyInstaller builds collect application icons; LAN address discovery still falls back to the active route when hostname resolution fails. Android builds use a locked Gradle cache at the actual configured path.
 
-Verification and remaining platform boundaries: see [REVIEW_0.6.4.md](REVIEW_0.6.3.md). No physical Windows PC or Android phone was available for this release; no claim of maximum throughput or physical 60/120 FPS is made.
+Verification and remaining platform boundaries: see [REVIEW_0.6.4.md](REVIEW_0.6.4.md). No physical Windows PC or Android phone was available for this release; no claim of maximum throughput or physical 60/120 FPS is made.
 
 ---
 

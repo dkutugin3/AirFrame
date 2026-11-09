@@ -1,3 +1,3 @@
 """AirFrame desktop Android receiver."""
 
-__version__ = "0.3.0"
+__version__ = "0.6.5"
