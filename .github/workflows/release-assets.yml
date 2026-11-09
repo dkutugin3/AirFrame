@@ -1,0 +1,72 @@
+name: AirFrame 0.6.5 release assets
+on:
+  push:
+    branches: [codex/release-artifacts-0.6.5]
+permissions:
+  contents: write
+jobs:
+  portable:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [windows-x64, macos-arm64, macos-x64]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: 31198151140a6e27af8a83510b30bf9dd822ab4c
+      - name: Build and test portable package from released source
+        env:
+          ARTIFACTS_DIR: ${{ github.workspace }}/packages
+        run: |
+          set -euo pipefail
+          sh scripts/build-portable.sh '${{ matrix.target }}' 2>&1 | tee build.log
+      - name: Audit bundled source and version
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, tarfile, zipfile, struct
+          target=os.environ['TARGET']
+          files=list(pathlib.Path('packages/portable').iterdir())
+          assert len(files)==1,files
+          p=files[0]
+          if target=='windows-x64':
+              a=zipfile.ZipFile(p);read=a.read;prefix='AirFrame/Lib/site-packages/'
+              assert a.testzip() is None
+              exe=read('AirFrame/AirFrame.exe');pe=struct.unpack_from('<I',exe,0x3c)[0]
+              assert exe[pe:pe+4]==b'PE\0\0' and struct.unpack_from('<H',exe,pe+4)[0]==0x8664
+              for item in ['python.exe','python314.dll','vcruntime140.dll','vcruntime140_1.dll']:
+                  assert 'AirFrame/'+item in a.namelist(),item
+              for item in ['PySide6/plugins/platforms/qwindows.dll','PySide6/plugins/multimedia/ffmpegmediaplugin.dll']:
+                  assert prefix+item in a.namelist(),item
+          else:
+              a=tarfile.open(p);read=lambda n:a.extractfile(n).read()
+              prefix='AirFrame.app/Contents/Resources/python/lib/python3.14/site-packages/'
+          for f in pathlib.Path('airframe').glob('*.py'):
+              assert read(prefix+'airframe/'+f.name)==f.read_bytes(),f
+          assert b'Version: 0.6.5' in read(prefix+'airframe-0.6.5.dist-info/METADATA')
+          a.close()
+          renamed=p.with_name(p.name.replace('AirFrame-','AirFrame-0.6.5-',1));p.rename(renamed)
+          print('PASS source/version/native payload audit:',renamed)
+          PY
+      - name: Export wheel
+        if: matrix.target == 'windows-x64'
+        env:
+          ARTIFACTS_DIR: ${{ github.workspace }}/packages
+        run: sh scripts/build-desktop.sh
+      - name: Upload wheel
+        if: matrix.target == 'windows-x64'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload v0.6.5 packages/desktop/*.whl --repo "$GITHUB_REPOSITORY" --clobber
+      - name: Upload verified package to draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload v0.6.5 packages/portable/* --repo "$GITHUB_REPOSITORY" --clobber
+      - name: Record verification summary
+        run: |
+          echo '### ${{ matrix.target }}' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Built from v0.6.5; Docker test stage and source/version/payload audit passed. Native Windows/device performance is unverified.' >> "$GITHUB_STEP_SUMMARY"
+
